@@ -3,7 +3,7 @@ import os
 import logging
 import random
 from datetime import datetime, timezone
-from typing import List
+from typing import List, Optional
 from urllib.parse import urlparse
 
 import boto3
@@ -68,7 +68,7 @@ def _new_session() -> Session:
 # -----------------------------------------------------------------------------
 # Background processing (stubbed prediction)
 # -----------------------------------------------------------------------------
-def _fake_model_predict(local_path: str, foul_hint: str | None = None) -> tuple[str, float]:
+def _fake_model_predict(local_path: str, foul_hint: Optional[str] = None) -> tuple[str, float]:
     """
     Stub: pretend to run a model and return (label, confidence).
     Later you'll replace this with real inference (RAG / fine-tuned model).
@@ -155,14 +155,14 @@ def health():
     return {"ok": True}
 
 # -----------------------------------------------------------------------------
-# Upload endpoint
+# Upload endpoint  (✅ fixed BackgroundTasks signature)
 # -----------------------------------------------------------------------------
 @app.post("/upload")
 async def upload_video(
     file: UploadFile = File(...),
     foul_type: str = Form(...),
-    notes: str | None = Form(None),
-    background_tasks: BackgroundTasks | None = None,
+    notes: Optional[str] = Form(None),
+    background_tasks: BackgroundTasks = ...,
 ):
     if not file or not file.filename:
         raise HTTPException(status_code=400, detail="No file provided.")
@@ -208,9 +208,8 @@ async def upload_video(
     finally:
         db.close()
 
-    # Queue background processing
-    if background_tasks is not None:
-        background_tasks.add_task(process_upload, rec.id)
+    # Queue background processing (no None-check needed)
+    background_tasks.add_task(process_upload, rec.id)
 
     return {
         "id": rec.id,
@@ -279,6 +278,5 @@ def retry(upload_id: int):
         db.commit()
     finally:
         db.close()
-    # You can make this asynchronous by using BackgroundTasks too
     process_upload(upload_id)
     return {"ok": True}
