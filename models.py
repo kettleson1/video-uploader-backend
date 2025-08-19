@@ -1,6 +1,15 @@
 # models.py
+from datetime import datetime
+from sqlalchemy import (
+    Column,
+    Integer,
+    String,
+    Text,
+    DateTime,
+    Float,
+    text,           # included for convenience when doing raw SQL elsewhere
+)
 from sqlalchemy.orm import declarative_base
-from sqlalchemy import Column, Integer, String, Text, DateTime, Float
 
 Base = declarative_base()
 
@@ -9,15 +18,20 @@ class Upload(Base):
 
     id = Column(Integer, primary_key=True, index=True)
 
-    # existing columns
+    # Core upload fields
     s3_url = Column(String, nullable=False)
     foul_type = Column(String, nullable=False)
     notes = Column(String)
-    timestamp = Column(DateTime)  # your table is "timestamp without time zone"
 
-    # new review/prediction fields (match your ALTER TABLE exactly)
-    status = Column(String(20), nullable=False, default="queued")      # queued|processing|done|error
+    # Original created-at (your table uses timestamp without time zone)
+    timestamp = Column(DateTime, default=datetime.utcnow)
+
+    # Review / prediction fields
+    status = Column(String(20), nullable=False, default="queued")  # queued|processing|done|error
     prediction_label = Column(String(120))
     confidence = Column(Float)
     processed_at = Column(DateTime(timezone=True))
     error_message = Column(Text)
+
+    # NEW: model explanation / rationale text
+    explanation = Column(Text)
