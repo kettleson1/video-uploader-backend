@@ -1,231 +1,343 @@
 # main.py
+from __future__ import annotations
+
 import os
-import logging
-import random
+import io
+import re
+import base64
+import shutil
+import tempfile
+import subprocess
 from datetime import datetime, timezone
 from typing import List, Optional
-from urllib.parse import urlparse
 
 import boto3
-from botocore.exceptions import ClientError
-from dotenv import load_dotenv
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Query, BackgroundTasks
+from fastapi import FastAPI, File, UploadFile, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
-
-from sqlalchemy import create_engine
+from fastapi.responses import JSONResponse
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, Session
+from dotenv import load_dotenv
+from openai import OpenAI
 
-from models import Base, Upload
+from models import Base, Upload  # Upload table with 'explanation' column etc.
 
-# -----------------------------------------------------------------------------
-# Setup & config
-# -----------------------------------------------------------------------------
+# ---------- Env / Clients ----------
 load_dotenv()
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("video-uploader")
-
+DATABASE_URL = os.getenv("DATABASE_URL")
 AWS_REGION = os.getenv("AWS_REGION", "us-east-2")
 BUCKET_NAME = os.getenv("AWS_S3_BUCKET")
-DATABASE_URL = os.getenv("DATABASE_URL")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-if not BUCKET_NAME or not DATABASE_URL:
-    raise RuntimeError("Missing AWS_S3_BUCKET or DATABASE_URL in environment.")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is not set")
+if not BUCKET_NAME:
+    raise RuntimeError("AWS_S3_BUCKET is not set")
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY is not set")
 
-# AWS S3 client
-s3_client = boto3.client("s3", region_name=AWS_REGION)
-
-# Database
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-
-# Create tables if needed
+SessionLocal = sessionmaker(bind=engine)
 Base.metadata.create_all(bind=engine)
 
-# FastAPI app
-app = FastAPI(title="Football Play Uploader")
+s3_client = boto3.client("s3", region_name=AWS_REGION)
+client = OpenAI(api_key=OPENAI_API_KEY)
 
-# CORS for local dev
+# ---------- FastAPI ----------
+app = FastAPI(title="Video Uploader RAG Backend")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:3001"],
+    allow_origins=[
+        "http://localhost:3000",
+        "http://localhost:3001",
+        "http://localhost:5173",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# -----------------------------------------------------------------------------
-# Utils
-# -----------------------------------------------------------------------------
+# ---------- Helpers ----------
+_slug_rx = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _slugify_filename(name: str) -> str:
+    # Remove path, collapse spaces, keep extension
+    base = os.path.basename(name).strip()
+    base = base.replace(" ", "_")
+    base = _slug_rx.sub("", base)
+    return base or "upload.bin"
+
+
 def _s3_key_from_url(url: str) -> str:
-    """Extract the S3 object key from a bucket URL."""
+    # https://<bucket>.s3.<region>.amazonaws.com/<key>  -> <key>
+    from urllib.parse import urlparse
     p = urlparse(url)
     return p.path[1:] if p.path.startswith("/") else p.path
 
-def _new_session() -> Session:
-    return SessionLocal()
 
-# -----------------------------------------------------------------------------
-# Background processing (stubbed prediction)
-# -----------------------------------------------------------------------------
-def _fake_model_predict(local_path: str, foul_hint: Optional[str] = None) -> tuple[str, float]:
-    """
-    Stub: pretend to run a model and return (label, confidence).
-    Later you'll replace this with real inference (RAG / fine-tuned model).
-    """
-    labels = ["Targeting", "Holding", "Pass Interference", "False Start", "Offside", "No Foul"]
-    if foul_hint and foul_hint in labels:
-        weights = [0.32 if l == foul_hint else 0.68 / (len(labels) - 1) for l in labels]
-    else:
-        weights = [1 / len(labels)] * len(labels)
-    label = random.choices(labels, weights=weights, k=1)[0]
-    confidence = round(random.uniform(0.55, 0.95), 2)
-    return label, confidence
+def _b64(fp: str) -> str:
+    with open(fp, "rb") as f:
+        return base64.b64encode(f.read()).decode("utf-8")
 
-def _download_s3_to_tmp(bucket: str, key: str) -> str:
-    """
-    Download the S3 object to a temp file and return local path.
-    If you don't need the file (e.g., model uses the S3 URL), skip this.
-    """
-    import tempfile
-    fd, path = tempfile.mkstemp(prefix="play_", suffix=os.path.splitext(key)[-1])
-    os.close(fd)
-    with open(path, "wb") as f:
-        s3_client.download_fileobj(bucket, key, f)
-    return path
 
-def process_upload(upload_id: int):
+def _extract_frames(video_path: str, max_frames: int = 6) -> List[str]:
     """
-    Background job:
-      - mark 'processing'
-      - (optional) download video from S3
-      - run stub model
-      - write prediction + confidence + processed_at
-    On failure: mark 'error' and record error_message.
+    Use ffmpeg to sample a handful of JPEG frames evenly across the clip.
+    Returns a list of local file paths to the saved JPEG frames.
     """
-    db = _new_session()
+    out_dir = tempfile.mkdtemp(prefix="frames_")
+    # Get duration
+    prob = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", video_path],
+        capture_output=True, text=True
+    )
+    duration = 0.0
     try:
-        rec = db.query(Upload).filter(Upload.id == upload_id).one_or_none()
-        if not rec:
+        duration = float(prob.stdout.strip())
+    except Exception:
+        duration = 0.0
+
+    timestamps = []
+    if duration > 0:
+        step = duration / (max_frames + 1)
+        timestamps = [max(0.0, (i + 1) * step) for i in range(max_frames)]
+    else:
+        timestamps = [0.0] * max_frames
+
+    frame_paths: List[str] = []
+    for idx, ts in enumerate(timestamps):
+        out_file = os.path.join(out_dir, f"frame_{idx:02d}.jpg")
+        # One frame at timestamp
+        subprocess.run(
+            ["ffmpeg", "-y", "-ss", f"{ts:.2f}", "-i", video_path,
+             "-frames:v", "1", "-q:v", "2", out_file],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        if os.path.exists(out_file):
+            frame_paths.append(out_file)
+
+    return frame_paths
+
+
+# ---------- 🔧 FIXED FUNCTION ----------
+def _summarize_frames(frames: List[str], foul_hint: Optional[str]) -> str:
+    """
+    Summarize the play from sampled frames using OpenAI Vision.
+
+    ✅ FIX: each image item must be:
+        {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..." }}
+    """
+    if not frames:
+        return "No frames extracted."
+
+    content = [{
+        "type": "text",
+        "text": (
+            "You are an NCAA football video analyst. "
+            "Given these still frames from a short clip, briefly describe what happens "
+            "in the play in 3–5 sentences. Emphasize actions relevant to judging fouls. "
+            f"Foul hint (may be wrong or missing): {foul_hint or '—'}"
+        ),
+    }]
+
+    for fp in frames:
+        content.append({
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:image/jpeg;base64,{_b64(fp)}"
+            }
+        })
+
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": content}],
+        temperature=0.2,
+        max_tokens=300,
+    )
+    return resp.choices[0].message.content.strip()
+
+
+def _embed(text_chunk: str) -> List[float]:
+    e = client.embeddings.create(model="text-embedding-3-small", input=text_chunk)
+    return e.data[0].embedding
+
+
+def _retrieve_rules(summary: str, limit: int = 3) -> List[dict]:
+    """
+    Retrieve relevant rule chunks from 'rules' table using pgvector.
+    Assumes schema: rules(id, title, section, body, embedding vector)
+    """
+    emb = _embed(summary)
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("""
+                SELECT id, title, section, body
+                FROM rules
+                ORDER BY embedding <-> :embedding
+                LIMIT :k
+            """),
+            {"embedding": emb, "k": limit}
+        ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+def _decide(summary: str, rules: List[dict], foul_hint: Optional[str]) -> tuple[str, float, str]:
+    """
+    Ask the model to predict foul/no-foul and explain, grounded in the retrieved rules.
+    Returns (label, confidence, explanation)
+    """
+    rule_blurbs = "\n\n".join(
+        [f"Rule {r['section'] or ''} - {r['title'] or ''}:\n{r['body']}" for r in rules]
+    ) or "No matching rules found."
+
+    sys = (
+        "You are an NCAA football officiating assistant. "
+        "Use the provided rules to decide if a foul occurred. "
+        "Return a JSON object with fields: prediction (string), confidence (0-1), explanation (short). "
+        "Be concise and rely on the rules. If unsure, say 'Inconclusive' with low confidence."
+    )
+
+    user = (
+        f"PLAY SUMMARY:\n{summary}\n\n"
+        f"FOUL HINT (may be wrong): {foul_hint or '—'}\n\n"
+        f"RULE EXCERPTS:\n{rule_blurbs}\n\n"
+        "Respond ONLY with JSON like:\n"
+        '{"prediction":"Holding","confidence":0.72,"explanation":"..."}'
+    )
+
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": sys},
+            {"role": "user", "content": user},
+        ],
+        temperature=0.1,
+        max_tokens=300,
+        response_format={"type": "json_object"},
+    )
+    import json
+    try:
+        data = json.loads(resp.choices[0].message.content)
+        pred = str(data.get("prediction", "Inconclusive"))
+        conf = float(data.get("confidence", 0.3))
+        expl = str(data.get("explanation", ""))
+        # Clamp confidence
+        conf = max(0.0, min(1.0, conf))
+        return pred, conf, expl
+    except Exception:
+        return "Inconclusive", 0.3, "Model output could not be parsed as JSON."
+
+
+# ---------- Background worker ----------
+def _process_upload_row(row_id: int):
+    db: Session = SessionLocal()
+    try:
+        row: Upload | None = db.get(Upload, row_id)
+        if not row:
             return
 
-        # Move to processing
-        rec.status = "processing"
-        rec.error_message = None
+        # Mark processing
+        row.status = "processing"
+        row.processed_at = datetime.now(timezone.utc)
+        row.error_message = None
         db.commit()
 
-        key = _s3_key_from_url(rec.s3_url)
+        # 1) Download from S3 to temp file
+        key = _s3_key_from_url(row.s3_url)
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+            s3_client.download_fileobj(BUCKET_NAME, key, tmp)
+            local_video = tmp.name
 
-        # OPTIONAL: download for local model usage
-        try:
-            local_path = _download_s3_to_tmp(BUCKET_NAME, key)
-        except ClientError as e:
-            local_path = ""
-            logger.warning("S3 download failed for %s: %s", key, e)
+        # 2) Extract frames
+        frames = _extract_frames(local_video, max_frames=6)
 
-        # Run fake model
-        label, conf = _fake_model_predict(local_path, foul_hint=rec.foul_type)
+        # 3) Summarize (✅ fixed)
+        summary = _summarize_frames(frames, row.foul_type)
 
-        # Persist results
-        rec.prediction_label = label
-        rec.confidence = conf
-        rec.processed_at = datetime.now(timezone.utc)
-        rec.status = "done"
+        # 4) Retrieve rules
+        rules = _retrieve_rules(summary, limit=3)
+
+        # 5) Decide
+        label, conf, explanation = _decide(summary, rules, row.foul_type)
+
+        # 6) Update DB
+        row.prediction_label = label
+        row.confidence = conf
+        row.explanation = explanation
+        row.status = "done"
+        row.processed_at = datetime.now(timezone.utc)
         db.commit()
+
     except Exception as e:
-        db.rollback()
-        try:
-            rec = db.query(Upload).filter(Upload.id == upload_id).one_or_none()
-            if rec:
-                rec.status = "error"
-                rec.error_message = str(e)[:2000]
-                rec.processed_at = datetime.now(timezone.utc)
-                db.commit()
-        except Exception:
-            db.rollback()
-        logger.exception("Processing failed for upload_id=%s", upload_id)
+        row = db.get(Upload, row_id)
+        if row:
+            row.status = "error"
+            row.error_message = f"{type(e).__name__}: {e}"
+            row.processed_at = datetime.now(timezone.utc)
+            db.commit()
     finally:
         db.close()
 
-# -----------------------------------------------------------------------------
-# Health
-# -----------------------------------------------------------------------------
+
+# ---------- Routes ----------
 @app.get("/health")
 def health():
     return {"ok": True}
 
-# -----------------------------------------------------------------------------
-# Upload endpoint  (✅ fixed BackgroundTasks signature)
-# -----------------------------------------------------------------------------
+
 @app.post("/upload")
 async def upload_video(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-    foul_type: str = Form(...),
-    notes: Optional[str] = Form(None),
-    background_tasks: BackgroundTasks = ...,
+    foul_type: str = Query(...),
+    notes: Optional[str] = Query(None),
 ):
-    if not file or not file.filename:
-        raise HTTPException(status_code=400, detail="No file provided.")
+    # Clean file name and build S3 key
+    clean_name = _slugify_filename(file.filename or "upload.bin")
+    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S%fZ")
+    key = f"videos/{ts}_{clean_name}"
 
-    # Unique S3 key
-    timestamp_str = datetime.utcnow().strftime("%Y%m%dT%H%M%S%fZ")
-    safe_name = os.path.basename(file.filename)
-    s3_key = f"videos/{timestamp_str}_{safe_name}"
+    # Save to a temp file first
+    with tempfile.NamedTemporaryFile(delete=False) as tmp:
+        shutil.copyfileobj(file.file, tmp)
+        tmp_path = tmp.name
 
     # Upload to S3
-    try:
-        file.file.seek(0)
-        extra_args = {"ContentType": file.content_type} if file.content_type else {}
-        s3_client.upload_fileobj(
-            Fileobj=file.file,
-            Bucket=BUCKET_NAME,
-            Key=s3_key,
-            ExtraArgs=extra_args or None,
-        )
-    except Exception as e:
-        logger.exception("S3 upload failed")
-        raise HTTPException(status_code=500, detail=f"S3 upload failed: {e}")
+    with open(tmp_path, "rb") as f:
+        s3_client.upload_fileobj(f, BUCKET_NAME, key, ExtraArgs={"ACL": "private"})
 
-    s3_url = f"https://{BUCKET_NAME}.s3.{AWS_REGION}.amazonaws.com/{s3_key}"
+    s3_url = f"https://{BUCKET_NAME}.s3.{AWS_REGION}.amazonaws.com/{key}"
 
-    # Save initial record
-    db = _new_session()
+    # Create DB row
+    db: Session = SessionLocal()
     try:
-        rec = Upload(
+        new_row = Upload(
             s3_url=s3_url,
             foul_type=foul_type,
-            notes=notes,
-            status="queued",
+            notes=notes or "",
             timestamp=datetime.utcnow(),
+            status="queued",
         )
-        db.add(rec)
+        db.add(new_row)
         db.commit()
-        db.refresh(rec)
-    except Exception as e:
-        db.rollback()
-        logger.exception("DB save failed")
-        raise HTTPException(status_code=500, detail=f"DB save failed: {e}")
+        db.refresh(new_row)
+        row_id = new_row.id
     finally:
         db.close()
 
-    # Queue background processing (no None-check needed)
-    background_tasks.add_task(process_upload, rec.id)
+    # Kick off background RAG pipeline
+    background_tasks.add_task(_process_upload_row, row_id)
 
-    return {
-        "id": rec.id,
-        "status": rec.status,
-        "s3_url": rec.s3_url,
-        "foul_type": rec.foul_type,
-        "notes": rec.notes,
-        "timestamp": rec.timestamp.isoformat() if rec.timestamp else None,
-    }
+    return {"id": row_id, "s3_url": s3_url, "status": "queued"}
 
-# -----------------------------------------------------------------------------
-# List recent plays with presigned URLs
-# -----------------------------------------------------------------------------
+
 @app.get("/api/plays")
-def list_recent_plays(limit: int = Query(20, ge=1, le=200)) -> List[dict]:
-    db = _new_session()
+def list_recent_plays(limit: int = Query(25, ge=1, le=200)) -> List[dict]:
+    db: Session = SessionLocal()
     try:
         rows = (
             db.query(Upload)
@@ -233,19 +345,14 @@ def list_recent_plays(limit: int = Query(20, ge=1, le=200)) -> List[dict]:
               .limit(limit)
               .all()
         )
-        out: List[dict] = []
+        out = []
         for r in rows:
             key = _s3_key_from_url(r.s3_url)
-            try:
-                presigned = s3_client.generate_presigned_url(
-                    ClientMethod="get_object",
-                    Params={"Bucket": BUCKET_NAME, "Key": key},
-                    ExpiresIn=3600,  # 1 hour
-                )
-            except Exception as e:
-                logger.warning("Failed to presign %s: %s", key, e)
-                presigned = None
-
+            presigned = s3_client.generate_presigned_url(
+                ClientMethod="get_object",
+                Params={"Bucket": BUCKET_NAME, "Key": key},
+                ExpiresIn=3600,
+            )
             out.append({
                 "id": r.id,
                 "foul_type": r.foul_type,
@@ -256,6 +363,7 @@ def list_recent_plays(limit: int = Query(20, ge=1, le=200)) -> List[dict]:
                 "confidence": r.confidence,
                 "processed_at": r.processed_at.isoformat() if r.processed_at else None,
                 "error_message": r.error_message,
+                "explanation": getattr(r, "explanation", None),
                 "s3_url": r.s3_url,
                 "presigned_url": presigned,
             })
@@ -263,20 +371,20 @@ def list_recent_plays(limit: int = Query(20, ge=1, le=200)) -> List[dict]:
     finally:
         db.close()
 
-# -----------------------------------------------------------------------------
-# Optional: manual retry
-# -----------------------------------------------------------------------------
+
 @app.post("/api/retry/{upload_id}")
-def retry(upload_id: int):
-    db = _new_session()
+def retry_processing(upload_id: int):
+    db: Session = SessionLocal()
     try:
-        rec = db.query(Upload).filter(Upload.id == upload_id).one_or_none()
-        if not rec:
-            raise HTTPException(status_code=404, detail="Not found")
-        rec.status = "queued"
-        rec.error_message = None
+        row = db.get(Upload, upload_id)
+        if not row:
+            return JSONResponse(status_code=404, content={"error": "Not found"})
+        row.status = "queued"
+        row.error_message = None
         db.commit()
     finally:
         db.close()
-    process_upload(upload_id)
-    return {"ok": True}
+
+    # Resume background process
+    _process_upload_row(upload_id)
+    return {"ok": True, "id": upload_id}
