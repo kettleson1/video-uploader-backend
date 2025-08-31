@@ -7,3 +7,11 @@ venv/
 __pycache__/
 *.pyc
 .DS_Store
+
+# local only
+.env
+.env.*
+venv/
+__pycache__/
+*.sqlite
+
