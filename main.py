@@ -141,30 +141,29 @@ def _summarize_frames(s3_url: str, foul_hint: str, notes: str) -> str:
 
 # ------------------ FIXED RETRIEVAL FUNCTION (pgvector) ----------------------
 
-from sqlalchemy import text as sql_text
+from sqlalchemy import text
 
-def _retrieve_rules(summary: str, top_k: int = 3) -> list[dict]:
+def _retrieve_rules(summary: str, top_k: int = 3):
     """
     Embed the summary and retrieve the closest rule chunks via pgvector.
-    Uses cosine distance (<=>). We pass the embedding as a vector literal
-    and cast with ::vector to avoid 'operator does not exist' errors.
+    Uses cosine distance (<=>). Builds a proper pgvector literal.
     """
     # 1) Embed the text (list of floats)
-    emb = _embed_text(summary)  # length must match rules.embedding dimension
+    emb = _embed_text(summary)  # length must match 1536
 
-    # 2) Build a pgvector literal: "[0.123,0.456,...]"
+    # 2) Build a pgvector literal like: '[0.1,0.2,...]'
     qvec_literal = "[" + ",".join(f"{x:.6f}" for x in emb) + "]"
 
     # 3) Query with proper casting to vector
-    sql = sql_text("""
+    sql = text("""
         SELECT
             id,
             title,
             section,
             body,
-            1 - (embedding <=> :qvec::vector) AS score  -- cosine similarity
+            1 - (embedding <=> (:qvec)::vector) AS score
         FROM rules
-        ORDER BY embedding <=> :qvec::vector
+        ORDER BY embedding <=> (:qvec)::vector
         LIMIT :k
     """)
 
@@ -181,7 +180,6 @@ def _retrieve_rules(summary: str, top_k: int = 3) -> list[dict]:
         }
         for r in rows
     ]
-
 # ------------- Decision model (simple; swap in your full RAG later) ----------
 
 def _decide_label(summary: str, retrieved: list[dict]) -> tuple[str, float, str]:
