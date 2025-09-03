@@ -1,160 +1,164 @@
-# main.py
 import os
-import io
 import re
-import time
+import io
 import base64
+import tempfile
+import subprocess
 from datetime import datetime, timezone
-from typing import Optional, List
+from typing import List, Optional
 
-from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-
-from dotenv import load_dotenv
 import boto3
-from botocore.exceptions import BotoCoreError, ClientError
-
+from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, Query
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, Session
+from openai import OpenAI
 
-from models import Base, Upload  # Upload table lives in models.py
+from models import Upload  # SQLAlchemy model for table `uploads`
 
-# ----- env & clients ---------------------------------------------------------
-load_dotenv()
-
-AWS_REGION = os.getenv("AWS_REGION", "us-east-2")
-BUCKET_NAME = os.getenv("AWS_S3_BUCKET")
-DATABASE_URL = os.getenv("DATABASE_URL")
+# =============================================================================
+# Config
+# =============================================================================
+DATABASE_URL   = os.getenv("DATABASE_URL")
+AWS_REGION     = os.getenv("AWS_REGION", "us-east-2")
+BUCKET_NAME    = os.getenv("AWS_S3_BUCKET")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-if not (BUCKET_NAME and DATABASE_URL):
-    raise RuntimeError("Missing required env vars: AWS_S3_BUCKET or DATABASE_URL")
+assert DATABASE_URL,   "DATABASE_URL not set"
+assert BUCKET_NAME,    "AWS_S3_BUCKET not set"
+assert OPENAI_API_KEY, "OPENAI_API_KEY not set"
 
-engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_size=5, max_overflow=10)
+# --- Option B: keep 3072-D embeddings ---------------------------------------
+EMBED_MODEL = "text-embedding-3-large"  # 3072-dim
+EMBED_DIM   = 3072
+
+# =============================================================================
+# Clients
+# =============================================================================
+engine = create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
-Base.metadata.create_all(bind=engine)
-
 s3_client = boto3.client("s3", region_name=AWS_REGION)
+client = OpenAI(api_key=OPENAI_API_KEY)
 
-# Optional OpenAI client (lazy import so running without key still works)
-openai_client = None
-if OPENAI_API_KEY:
-    try:
-        from openai import OpenAI
-        openai_client = OpenAI(api_key=OPENAI_API_KEY)
-    except Exception:
-        openai_client = None
-
-# ----- FastAPI ---------------------------------------------------------------
-app = FastAPI(title="Video Uploader Backend", version="1.0")
-
+# =============================================================================
+# App
+# =============================================================================
+app = FastAPI(title="Video Uploader Backend (RAG 3072D)")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:3001", "http://127.0.0.1:3000", "http://127.0.0.1:3001"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ----- helpers ---------------------------------------------------------------
+# =============================================================================
+# Helpers
+# =============================================================================
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
 
-def _safe_error(e: Exception | str) -> str:
-    """Always return a plain string for DB storage/UI."""
+def _safe_err_text(err: Exception) -> str:
+    """Always store a string in DB error_message."""
     try:
-        return str(e)
+        return str(err)
     except Exception:
-        return "Unknown error"
-
-def _safe_b64(data: bytes) -> str:
-    """Base64-encode bytes and return a UTF-8 string (never bytes)."""
-    return base64.b64encode(data).decode("utf-8")
-
-def _safe_filename(name: str) -> str:
-    base = os.path.basename(name)
-    # replace spaces and bad chars
-    base = re.sub(r"[^\w\-.]+", "_", base)
-    # trim to something reasonable
-    return base[:120] or "upload.bin"
+        return "Unhandled error"
 
 def _s3_key_from_url(url: str) -> str:
-    # Works for both virtual-hosted and path-style URLs if path contains the key.
-    # We stored full https URL; everything after the bucket host is the key.
-    # Example: https://bucket.s3.region.amazonaws.com/videos/file.mp4
-    # Split on ".amazonaws.com/" and take the tail.
-    marker = ".amazonaws.com/"
-    if marker in url:
-        return url.split(marker, 1)[1]
-    # Fallback: try to strip the protocol/host and return the path minus leading slash
-    return url.split("/", 3)[-1].lstrip("/")
+    from urllib.parse import urlparse
+    p = urlparse(url)
+    return p.path[1:] if p.path.startswith("/") else p.path
 
-# --- Embeddings / summarization stubs (kept simple; can be upgraded later) ---
-
-def _embed_text(text_input: str) -> List[float]:
-    """
-    Returns a list[float] for pgvector. If OPENAI key isn't set, return a tiny fake vector.
-    """
-    if openai_client:
-        resp = openai_client.embeddings.create(
-            model="text-embedding-3-large",
-            input=text_input.strip()[:8000],
-        )
-        return resp.data[0].embedding  # type: ignore[attr-defined]
-    # fallback deterministic small vector (dimension 1536 expected; we can pad)
-    import math
-    vals = [math.sin(i) for i in range(64)]
-    # pad to 1536 with zeros so cosine ops work
-    return vals + [0.0] * (1536 - len(vals))
-
-def _summarize_frames(s3_url: str, foul_hint: str, notes: str) -> str:
-    """
-    Very light 'summary' to keep pipeline flowing. If OpenAI is configured,
-    produce a short description using text completion; otherwise return a heuristic string.
-    """
-    base_hint = foul_hint or "Unknown foul"
-    base_notes = (notes or "").strip()
-    base_desc = f"Video of a football play. Foul hint: {base_hint}."
-    if base_notes:
-        base_desc += f" Notes: {base_notes}."
-    if not openai_client:
-        return base_desc
-
-    prompt = (
-        "You are assisting a football officiating tool. "
-        "Write a one-sentence neutral summary of the referenced play (do NOT judge legality). "
-        f"Use this context as hints: foul hint={base_hint}; notes='{base_notes}'."
+def _presign(key: str, expires: int = 3600) -> str:
+    return s3_client.generate_presigned_url(
+        ClientMethod="get_object",
+        Params={"Bucket": BUCKET_NAME, "Key": key},
+        ExpiresIn=expires,
     )
-    try:
-        resp = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You write concise, neutral descriptions of plays."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.2,
-            max_tokens=80,
-        )
-        return resp.choices[0].message.content.strip()  # type: ignore[attr-defined]
-    except Exception as e:
-        return f"{base_desc} (summary-fallback: {_safe_error(e)})"
 
-# ------------------ FIXED RETRIEVAL FUNCTION (pgvector) ----------------------
-
-from sqlalchemy import text
-
-def _retrieve_rules(summary: str, top_k: int = 3):
+def _extract_frames(video_bytes: bytes, fps: int = 1, max_frames: int = 6) -> List[bytes]:
     """
-    Embed the summary and retrieve the closest rule chunks via pgvector.
-    Uses cosine distance (<=>). Builds a proper pgvector literal.
+    Use ffmpeg to sample up to `max_frames` PNG frames at `fps`.
+    Returns raw PNG bytes for each extracted frame.
     """
-    # 1) Embed the text (list of floats)
-    emb = _embed_text(summary)  # length must match 1536
+    frames: List[bytes] = []
+    with tempfile.TemporaryDirectory() as td:
+        in_path = os.path.join(td, "clip.mp4")
+        with open(in_path, "wb") as f:
+            f.write(video_bytes)
 
-    # 2) Build a pgvector literal like: '[0.1,0.2,...]'
-    qvec_literal = "[" + ",".join(f"{x:.6f}" for x in emb) + "]"
+        out_pattern = os.path.join(td, "f_%03d.png")
+        cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-i", in_path, "-vf", f"fps={fps}",
+            "-frames:v", str(max_frames),
+            out_pattern,
+        ]
+        subprocess.run(cmd, check=True)
 
-    # 3) Query with proper casting to vector
+        for name in sorted(p for p in os.listdir(td) if p.startswith("f_") and p.endswith(".png")):
+            with open(os.path.join(td, name), "rb") as pf:
+                frames.append(pf.read())
+    return frames
+
+def _summarize_frames(frames: List[bytes]) -> str:
+    """
+    Vision summary using GPT-4o-mini: send 2–3 frames as data URLs with a concise prompt.
+    """
+    if not frames:
+        return "No visual content extracted."
+
+    pick = frames[:3]
+    content: List[dict] = [
+        {"type": "text",
+         "text": (
+             "You are an analyst for NCAA football officiating. "
+             "Summarize what happens in these frames (players, ball, snap/LOS, contact, likely fouls) "
+             "in 3–5 concise bullet points."
+         )}
+    ]
+    for b in pick:
+        # Ensure base64 is a *string*
+        b64 = base64.b64encode(b).decode("utf-8")
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/png;base64,{b64}"}
+        })
+
+    chat = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": content}],
+        temperature=0.2,
+    )
+    return chat.choices[0].message.content or "No summary."
+
+def _embed_text(text_: str) -> List[float]:
+    """
+    Create a 3072-D embedding, defensively padding/trimming to EMBED_DIM.
+    """
+    text_ = (text_ or "").strip()
+    if not text_:
+        return [0.0] * EMBED_DIM
+
+    vec = client.embeddings.create(model=EMBED_MODEL, input=text_).data[0].embedding
+    if len(vec) != EMBED_DIM:
+        if len(vec) > EMBED_DIM:
+            vec = vec[:EMBED_DIM]
+        else:
+            vec = vec + [0.0] * (EMBED_DIM - len(vec))
+    return vec
+
+def _retrieve_rules(summary: str, top_k: int = 3) -> List[dict]:
+    """
+    Embed the summary (3072-D) and retrieve closest rule chunks via pgvector cosine distance.
+    We pass a vector literal (no spaces inside the brackets) and cast using ::vector.
+    """
+    emb = _embed_text(summary)  # 3072-D
+    qvec_literal = "[" + ",".join(f"{x:.6f}" for x in emb) + "]"  # IMPORTANT: no spaces
+
     sql = text("""
         SELECT
             id,
@@ -166,7 +170,6 @@ def _retrieve_rules(summary: str, top_k: int = 3):
         ORDER BY embedding <=> (:qvec)::vector
         LIMIT :k
     """)
-
     with engine.begin() as conn:
         rows = conn.execute(sql, {"qvec": qvec_literal, "k": top_k}).mappings().all()
 
@@ -180,166 +183,148 @@ def _retrieve_rules(summary: str, top_k: int = 3):
         }
         for r in rows
     ]
-# ------------- Decision model (simple; swap in your full RAG later) ----------
 
-def _decide_label(summary: str, retrieved: list[dict]) -> tuple[str, float, str]:
+def _decide_label(summary: str, retrieved: List[dict]) -> tuple[str, float, str]:
     """
-    Produce (label, confidence, explanation). Uses OpenAI if available; otherwise a stub.
+    Ask the model for a foul label + 0–1 confidence + short explanation grounded in retrieved rules.
     """
-    if not openai_client:
-        # Simple heuristic fallback
-        label = "Holding" if "hold" in summary.lower() else "Offside"
-        return label, 0.70, "Stub predictor. Replace with RAG logic."
-
     rules_text = "\n\n".join(
-        f"[{r.get('title','Rule')}{' - ' + r.get('section','') if r.get('section') else ''}]\n{r.get('body','')}"
-        for r in retrieved
-    ) or "(no rules)"
+        f"[{i+1}] {r['title']} {r.get('section','')}\n{r['body']}"
+        for i, r in enumerate(retrieved)
+    ) or "(no rules retrieved)"
 
-    user_msg = (
-        "Given this summary of a play and relevant NCAA rule snippets, "
-        "predict the foul (single label), provide a 0-1 confidence, and a brief explanation.\n\n"
-        f"Summary:\n{summary}\n\nRules:\n{rules_text}\n\n"
-        "Return a strict JSON object with keys: label (string), confidence (number between 0 and 1), explanation (string)."
+    prompt = (
+        "You are an NCAA football rules analyst. Given the play summary and rule snippets, "
+        "choose the most likely foul label from: "
+        "['False Start','Offside','Holding','Pass Interference','Targeting','None'].\n"
+        "Return JSON with keys: label (string), confidence (0..1), explanation (<=2 sentences).\n\n"
+        f"Play summary:\n{summary}\n\nRules:\n{rules_text}"
     )
 
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.1,
+        response_format={"type": "json_object"},
+    )
+    raw = resp.choices[0].message.content or "{}"
+    import json
     try:
-        resp = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are a precise assistant for football officiating decisions."},
-                {"role": "user", "content": user_msg},
-            ],
-            temperature=0.2,
-            max_tokens=200,
-            response_format={"type": "json_object"},
-        )
-        content = resp.choices[0].message.content  # type: ignore[attr-defined]
-        import json
-        data = json.loads(content)
-        label = str(data.get("label") or "Unknown")
-        conf = float(data.get("confidence") or 0.5)
-        expl = str(data.get("explanation") or "")
-        conf = max(0.0, min(1.0, conf))
-        return label, conf, expl
-    except Exception as e:
-        return "Unknown", 0.5, f"Decision fallback: {_safe_error(e)}"
+        js = json.loads(raw)
+        label = str(js.get("label") or "None")
+        conf = float(js.get("confidence") or 0.5)
+        expl = str(js.get("explanation") or "")
+    except Exception:
+        label, conf, expl = "None", 0.5, "Model output was not valid JSON."
 
-# --------------------------- background worker -------------------------------
+    return label, conf, expl
 
-def _process_upload(upload_id: int) -> None:
+# =============================================================================
+# Background worker
+# =============================================================================
+def _process_upload_bg(upload_id: int, s3_url: str, foul_hint: str):
     db: Session = SessionLocal()
     try:
-        row: Optional[Upload] = db.get(Upload, upload_id)
-        if not row:
-            return
-        # mark running
-        row.status = "processing"
-        row.error_message = None
-        db.commit()
+        # 1) Download bytes
+        key = _s3_key_from_url(s3_url)
+        obj = s3_client.get_object(Bucket=BUCKET_NAME, Key=key)
+        video_bytes: bytes = obj["Body"].read()
 
-        # Summarize
-        summary = _summarize_frames(row.s3_url, row.foul_type or "", row.notes or "")
+        # 2) Frames -> summary
+        frames = _extract_frames(video_bytes, fps=1, max_frames=6)
+        summary = _summarize_frames(frames)
 
-        # Retrieve rules
+        # 3) Retrieve + 4) Decide
         retrieved = _retrieve_rules(summary, top_k=3)
-
-        # Decide
         label, conf, expl = _decide_label(summary, retrieved)
 
-        # update row
-        row.prediction_label = label
-        row.confidence = conf
-        # ensure explanation column exists in your models.py (as Text or String)
-        if hasattr(row, "explanation"):
-            row.explanation = expl  # type: ignore[attr-defined]
-        row.processed_at = datetime.now(timezone.utc)
-        row.status = "done"
-        db.commit()
+        # 5) Update DB
+        row = db.query(Upload).get(upload_id)
+        if row:
+            row.status = "done"
+            row.prediction_label = label
+            row.confidence = conf
+            row.explanation = expl
+            row.processed_at = _now_utc()
+            row.error_message = None
+            db.commit()
     except Exception as e:
-        # store stringified error
-        try:
-            row = db.get(Upload, upload_id)
-            if row:
-                row.status = "error"
-                row.error_message = _safe_error(e)
-                row.processed_at = datetime.now(timezone.utc)
-                db.commit()
-        except Exception:
-            pass
+        row = db.query(Upload).get(upload_id)
+        if row:
+            row.status = "error"
+            row.error_message = _safe_err_text(e)  # stringify error
+            row.processed_at = _now_utc()
+            db.commit()
     finally:
         db.close()
 
-# ------------------------------- routes --------------------------------------
+# =============================================================================
+# Schemas
+# =============================================================================
+class UploadResponse(BaseModel):
+    id: int
+    s3_url: str
 
+# =============================================================================
+# Routes
+# =============================================================================
 @app.get("/health")
 def health():
     return {"ok": True}
 
-@app.post("/upload")
+@app.post("/upload", response_model=UploadResponse)
 async def upload_video(
     background_tasks: BackgroundTasks,
-    file: UploadFile = File(..., description="Video file"),
+    file: UploadFile = File(...),
     foul_type: str = Form(...),
-    notes: Optional[str] = Form(None),
+    notes: str = Form(""),
 ):
-    filename = _safe_filename(file.filename or "upload.bin")
-    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S%fZ")
-    key = f"videos/{ts}_{filename}"
+    data = await file.read()
 
-    # upload to S3
-    try:
-        body = await file.read()
-        s3_client.put_object(Bucket=BUCKET_NAME, Key=key, Body=body, ContentType=file.content_type or "application/octet-stream")
-    except (BotoCoreError, ClientError) as e:
-        raise HTTPException(status_code=500, detail=f"S3 upload failed: {_safe_error(e)}")
+    # Clean filename (no spaces / weird chars)
+    clean_name = re.sub(r"[^A-Za-z0-9._-]+", "_", file.filename or "clip.mp4")
+    stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S%fZ")
+    key = f"videos/{stamp}_{clean_name}"
 
+    # Upload to S3
+    s3_client.put_object(Bucket=BUCKET_NAME, Key=key, Body=data, ContentType="video/mp4")
     s3_url = f"https://{BUCKET_NAME}.s3.{AWS_REGION}.amazonaws.com/{key}"
 
-    # write DB row
+    # Create DB row
     db: Session = SessionLocal()
     try:
-        row = Upload(
+        rec = Upload(
             s3_url=s3_url,
             foul_type=foul_type,
-            notes=notes or "",
+            notes=notes,
             timestamp=datetime.utcnow(),
             status="queued",
         )
-        db.add(row)
+        db.add(rec)
         db.commit()
-        db.refresh(row)
-        upload_id = row.id
+        db.refresh(rec)
+
+        # Kick background
+        background_tasks.add_task(_process_upload_bg, rec.id, s3_url, foul_type)
+
+        return UploadResponse(id=rec.id, s3_url=s3_url)
     finally:
         db.close()
 
-    # queue background work
-    background_tasks.add_task(_process_upload, upload_id)
-
-    return {"ok": True, "id": upload_id, "s3_url": s3_url}
-
 @app.get("/api/plays")
-def list_recent_plays(limit: int = Query(20, ge=1, le=200)) -> List[dict]:
+def list_recent_plays(limit: int = Query(25, ge=1, le=200)) -> List[dict]:
     db: Session = SessionLocal()
     try:
         rows = (
             db.query(Upload)
-            .order_by(Upload.id.desc())
-            .limit(limit)
-            .all()
+              .order_by(Upload.id.desc())
+              .limit(limit)
+              .all()
         )
         out = []
         for r in rows:
             key = _s3_key_from_url(r.s3_url)
-            try:
-                presigned = s3_client.generate_presigned_url(
-                    ClientMethod="get_object",
-                    Params={"Bucket": BUCKET_NAME, "Key": key},
-                    ExpiresIn=3600,
-                )
-            except Exception:
-                presigned = r.s3_url  # fallback
-
+            presigned = _presign(key, 3600)
             out.append({
                 "id": r.id,
                 "foul_type": r.foul_type,
@@ -348,7 +333,7 @@ def list_recent_plays(limit: int = Query(20, ge=1, le=200)) -> List[dict]:
                 "status": r.status,
                 "prediction_label": r.prediction_label,
                 "confidence": r.confidence,
-                "processed_at": r.processed_at.isoformat() if getattr(r, "processed_at", None) else None,
+                "processed_at": r.processed_at.isoformat() if r.processed_at else None,
                 "error_message": r.error_message,
                 "explanation": getattr(r, "explanation", None),
                 "s3_url": r.s3_url,
@@ -359,19 +344,20 @@ def list_recent_plays(limit: int = Query(20, ge=1, le=200)) -> List[dict]:
         db.close()
 
 @app.post("/api/retry/{upload_id}")
-def retry_upload(upload_id: int, background_tasks: BackgroundTasks):
+def retry_upload(upload_id: int):
     db: Session = SessionLocal()
     try:
-        row: Optional[Upload] = db.get(Upload, upload_id)
+        row = db.query(Upload).get(upload_id)
         if not row:
-            raise HTTPException(status_code=404, detail="Upload not found")
+            return {"ok": False, "error": "Not found"}
 
         row.status = "queued"
         row.error_message = None
         row.processed_at = None
         db.commit()
 
-        background_tasks.add_task(_process_upload, upload_id)
+        # Run synchronously here; for production use a background queue/worker
+        _process_upload_bg(upload_id=row.id, s3_url=row.s3_url, foul_hint=row.foul_type)
         return {"ok": True, "id": upload_id}
     finally:
         db.close()

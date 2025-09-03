@@ -1,139 +1,74 @@
-# ingest_rules.py
-from __future__ import annotations
-
 import os
-import glob
-import json
-from pathlib import Path
-from typing import List
-
-from dotenv import load_dotenv
+from glob import glob
 from sqlalchemy import create_engine, text
 from openai import OpenAI
 
-# ---------- Env / Setup ----------
-load_dotenv()
-
 DATABASE_URL = os.getenv("DATABASE_URL")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-RULES_DIR = os.getenv("RULES_DIR", "rules")  # directory of *.txt files to ingest
-EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")  # 1536 dims
+assert DATABASE_URL, "DATABASE_URL not set"
+assert OPENAI_API_KEY, "OPENAI_API_KEY not set"
 
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL is not set")
-if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY is not set")
+EMBED_MODEL = "text-embedding-3-large"  # 3072-D
+EMBED_DIM   = 3072
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
 client = OpenAI(api_key=OPENAI_API_KEY)
 
+def _embed_text(txt: str) -> list[float]:
+    txt = (txt or "").strip()
+    if not txt:
+        return [0.0] * EMBED_DIM
+    vec = client.embeddings.create(model=EMBED_MODEL, input=txt).data[0].embedding
+    if len(vec) != EMBED_DIM:
+        if len(vec) > EMBED_DIM:
+            vec = vec[:EMBED_DIM]
+        else:
+            vec = vec + [0.0] * (EMBED_DIM - len(vec))
+    return vec
 
-# ---------- DB bootstrap ----------
-DDL = """
-CREATE EXTENSION IF NOT EXISTS vector;
-
-CREATE TABLE IF NOT EXISTS rules (
-  id BIGSERIAL PRIMARY KEY,
-  title   TEXT,
-  section TEXT,
-  body    TEXT NOT NULL,
-  embedding vector(1536)
-);
-
--- for upsert by natural key
-DO $$
-BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_indexes
-    WHERE schemaname = 'public' AND indexname = 'uq_rules_title_section'
-  ) THEN
-    EXECUTE 'CREATE UNIQUE INDEX uq_rules_title_section ON rules (title, section)';
-  END IF;
-END $$;
-"""
-
-# Upsert (if conflict on title+section, update body & embedding)
-UPSERT = text("""
-INSERT INTO rules (title, section, body, embedding)
-VALUES (:title, :section, :body, (:embedding)::vector)
-ON CONFLICT (title, section)
-DO UPDATE SET
-  body = EXCLUDED.body,
-  embedding = EXCLUDED.embedding
-""")
-
-# ---------- Helpers ----------
-def embed_texts(texts: List[str]) -> List[List[float]]:
-    """Batch embed texts; returns list of 1536-d float vectors."""
-    resp = client.embeddings.create(model=EMBED_MODEL, input=texts)
-    return [d.embedding for d in resp.data]
-
-def load_rule_files() -> list[tuple[str, str]]:
+def upsert_rule_chunks(title: str, section_prefix: str, body: str) -> int:
     """
-    Returns list of (filename_without_ext, file_contents)
-    for all *.txt in RULES_DIR.
+    Splits body into simple paragraphs, embeds each, and UPSERTS into rules(title, section, body, embedding).
+    Your table must be:
+      id bigserial PK,
+      title text,
+      section text,
+      body text NOT NULL,
+      embedding vector(3072)
     """
-    files = sorted(glob.glob(str(Path(RULES_DIR) / "*.txt")))
-    out: list[tuple[str, str]] = []
-    for fp in files:
-        try:
-            text_content = Path(fp).read_text(encoding="utf-8").strip()
-            if text_content:
-                out.append((Path(fp).stem, text_content))
-        except Exception as e:
-            print(f"⚠️  Skipping {fp}: {e}")
-    return out
+    # very simple chunking by blank lines
+    chunks = [p.strip() for p in body.split("\n\n") if p.strip()]
+    inserted = 0
 
-def chunk_text(body: str, max_chars: int = 2000) -> list[str]:
-    """
-    Simple chunker to keep bodies from being too long for embedding.
-    """
-    body = " ".join(body.split())  # collapse whitespace
-    if len(body) <= max_chars:
-        return [body]
-    chunks = []
-    i = 0
-    while i < len(body):
-        chunks.append(body[i:i+max_chars])
-        i += max_chars
-    return chunks
-
-
-# ---------- Main ----------
-def main():
-    # 1) Ensure schema
     with engine.begin() as conn:
-        conn.execute(text(DDL))
-    print("✅ Schema ready (extension/table/index).")
+        for idx, ch in enumerate(chunks, start=1):
+            emb = _embed_text(ch)
+            qvec_literal = "[" + ",".join(f"{x:.6f}" for x in emb) + "]"
 
-    # 2) Load rule files
-    pairs = load_rule_files()
-    if not pairs:
-        print(f"⚠️  No rule files found in '{RULES_DIR}/'. Add *.txt files and retry.")
+            sql = text("""
+                INSERT INTO rules (title, section, body, embedding)
+                VALUES (:title, :sec, :body, (:emb)::vector)
+            """)
+            conn.execute(sql, {"title": title, "sec": f"{section_prefix}{idx}", "body": ch, "emb": qvec_literal})
+            inserted += 1
+
+    return inserted
+
+def main():
+    rules_dir = os.path.join(os.getcwd(), "rules")
+    files = sorted(glob(os.path.join(rules_dir, "*.txt")))
+    if not files:
+        print("No rule files found in ./rules/*.txt")
         return
-
-    total_inserted = 0
-    for title, body in pairs:
-        chunks = chunk_text(body)
-        vecs = embed_texts(chunks)
-
-        # Upsert each chunk with a numbered section label
-        with engine.begin() as conn:
-            for i, (chunk, vec) in enumerate(zip(chunks, vecs), start=1):
-                params = {
-                    "title": title,
-                    "section": f"chunk-{i}",
-                    "body": chunk,
-                    # Bind as JSON text then cast to ::vector in SQL
-                    "embedding": json.dumps(vec),
-                }
-                conn.execute(UPSERT, params)
-                total_inserted += 1
-
-        print(f"✔️  Upserted {len(chunks)} chunk(s) for '{title}'")
-
-    print(f"🎉 Ingest complete. Total chunks upserted: {total_inserted}")
-
+    total = 0
+    for fp in files:
+        title = os.path.splitext(os.path.basename(fp))[0]
+        with open(fp, "r", encoding="utf-8") as f:
+            body = f.read()
+        n = upsert_rule_chunks(title=title, section_prefix="chunk", body=body)
+        total += n
+        print(f"Inserted {n} chunks from {title}.txt")
+    print(f"✅ Ingest complete. Total chunks: {total}")
 
 if __name__ == "__main__":
     main()
