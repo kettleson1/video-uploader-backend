@@ -16,3 +16,4 @@ __pycache__/
 *.sqlite
 
 .env
+.env

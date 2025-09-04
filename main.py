@@ -13,6 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy import text   # make sure this is already imported at the top
 from openai import OpenAI
 
 from models import Upload  # SQLAlchemy model for table `uploads`
@@ -151,25 +152,30 @@ def _embed_text(text_: str) -> List[float]:
             vec = vec + [0.0] * (EMBED_DIM - len(vec))
     return vec
 
-def _retrieve_rules(summary: str, top_k: int = 3) -> List[dict]:
+def _retrieve_rules(summary: str, top_k: int = 3):
     """
-    Embed the summary (3072-D) and retrieve closest rule chunks via pgvector cosine distance.
-    We pass a vector literal (no spaces inside the brackets) and cast using ::vector.
+    Embed the summary and retrieve the closest rule chunks via pgvector.
+    Uses cosine distance. The embedding column is vector(3072).
     """
-    emb = _embed_text(summary)  # 3072-D
-    qvec_literal = "[" + ",".join(f"{x:.6f}" for x in emb) + "]"  # IMPORTANT: no spaces
+    # 1) Make a 3072-D embedding
+    emb = _embed_text(summary)  # must be length 3072
 
+    # 2) Build a pgvector literal: "[0.123,0.456,...]"
+    qvec_literal = "[" + ",".join(f"{x:.6f}" for x in emb) + "]"
+
+    # 3) Query with proper casting and bound params
     sql = text("""
         SELECT
             id,
             title,
             section,
             body,
-            1 - (embedding <=> (:qvec)::vector) AS score
+            1 - (embedding <=> (:qvec)::vector) AS score  -- cosine similarity
         FROM rules
         ORDER BY embedding <=> (:qvec)::vector
         LIMIT :k
     """)
+
     with engine.begin() as conn:
         rows = conn.execute(sql, {"qvec": qvec_literal, "k": top_k}).mappings().all()
 
@@ -183,7 +189,6 @@ def _retrieve_rules(summary: str, top_k: int = 3) -> List[dict]:
         }
         for r in rows
     ]
-
 def _decide_label(summary: str, retrieved: List[dict]) -> tuple[str, float, str]:
     """
     Ask the model for a foul label + 0–1 confidence + short explanation grounded in retrieved rules.
