@@ -7,16 +7,19 @@ import subprocess
 from datetime import datetime, timezone
 from typing import List, Optional
 
+from dotenv import load_dotenv
+load_dotenv()  # so .env is picked up for DATABASE_URL, OPENAI_API_KEY, etc.
+
 import boto3
 from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, Session
-from sqlalchemy import text   # make sure this is already imported at the top
+from sqlalchemy import text as sqltext   # <-- use this everywhere you need raw SQL
 from openai import OpenAI
 
-from models import Upload  # SQLAlchemy model for table `uploads`
+from models import Upload  # your SQLAlchemy model
 
 # =============================================================================
 # Config
@@ -25,6 +28,9 @@ DATABASE_URL   = os.getenv("DATABASE_URL")
 AWS_REGION     = os.getenv("AWS_REGION", "us-east-2")
 BUCKET_NAME    = os.getenv("AWS_S3_BUCKET")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+# confidence threshold (default 0.60)
+CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.60"))
 
 assert DATABASE_URL,   "DATABASE_URL not set"
 assert BUCKET_NAME,    "AWS_S3_BUCKET not set"
@@ -159,12 +165,13 @@ def _retrieve_rules(summary: str, top_k: int = 3):
     """
     # 1) Make a 3072-D embedding
     emb = _embed_text(summary)  # must be length 3072
+    # (optional sanity) assert len(emb) == 3072, f"Expected 3072-d emb, got {len(emb)}"
 
     # 2) Build a pgvector literal: "[0.123,0.456,...]"
     qvec_literal = "[" + ",".join(f"{x:.6f}" for x in emb) + "]"
 
     # 3) Query with proper casting and bound params
-    sql = text("""
+    sql = sqltext("""
         SELECT
             id,
             title,
@@ -223,7 +230,6 @@ def _decide_label(summary: str, retrieved: List[dict]) -> tuple[str, float, str]
         label, conf, expl = "None", 0.5, "Model output was not valid JSON."
 
     return label, conf, expl
-
 # =============================================================================
 # Background worker
 # =============================================================================
@@ -239,30 +245,37 @@ def _process_upload_bg(upload_id: int, s3_url: str, foul_hint: str):
         frames = _extract_frames(video_bytes, fps=1, max_frames=6)
         summary = _summarize_frames(frames)
 
-        # 3) Retrieve + 4) Decide
+        # 3) Retrieve rules + 4) Decide
         retrieved = _retrieve_rules(summary, top_k=3)
         label, conf, expl = _decide_label(summary, retrieved)
 
+        # --- Confidence thresholding ---
+        final_label = label
+        final_conf = float(conf or 0.0)
+        if final_conf < CONFIDENCE_THRESHOLD:
+            final_label = "Uncertain"
+
         # 5) Update DB
-        row = db.query(Upload).get(upload_id)
+        row = db.get(Upload, upload_id)  # works on SQLAlchemy 1.4/2.x
         if row:
             row.status = "done"
-            row.prediction_label = label
-            row.confidence = conf
+            row.prediction_label = final_label
+            row.confidence = final_conf
             row.explanation = expl
             row.processed_at = _now_utc()
             row.error_message = None
             db.commit()
+
     except Exception as e:
-        row = db.query(Upload).get(upload_id)
+        # Defensive: stringify any error
+        row = db.get(Upload, upload_id)
         if row:
             row.status = "error"
-            row.error_message = _safe_err_text(e)  # stringify error
+            row.error_message = _safe_err_text(e)
             row.processed_at = _now_utc()
             db.commit()
     finally:
         db.close()
-
 # =============================================================================
 # Schemas
 # =============================================================================
@@ -366,3 +379,39 @@ def retry_upload(upload_id: int):
         return {"ok": True, "id": upload_id}
     finally:
         db.close()
+
+@app.get("/api/rules/search")
+def search_rules(q: str = Query(..., min_length=2), k: int = Query(3, ge=1, le=10)):
+    """
+    Quick retrieval endpoint to sanity-check embeddings & pgvector search.
+    Returns top-K rule chunks for the given free-text query.
+    """
+    try:
+        emb = _embed_text(q)  # should be 3072-D for text-embedding-3-large
+        # vector literal: "[0.1,0.2,...]"
+        qvec_literal = "[" + ",".join(f"{x:.6f}" for x in emb) + "]"  # ensure string
+
+        sql = sqltext("""
+            SELECT id, title, section, body,
+                   1 - (embedding <=> (:qvec)::vector) AS score
+            FROM rules
+            ORDER BY embedding <=> (:qvec)::vector
+            LIMIT :k
+        """)
+
+        with engine.begin() as conn:
+            rows = conn.execute(sql, {"qvec": qvec_literal, "k": k}).mappings().all()
+
+        return [
+            {
+                "id": r["id"],
+                "title": r["title"],
+                "section": r["section"],
+                "score": float(r["score"]) if r["score"] is not None else None,
+                "body": r["body"],
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        # Defensive: always stringify errors
+        return {"error": str(e)}
