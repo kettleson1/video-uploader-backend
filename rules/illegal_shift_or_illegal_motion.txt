@@ -1,0 +1,3 @@
+Illegal Shift or Illegal Motion: Multiple players shifting or a player moving forward at the snap without being set for one second.
+Penalty: Loss of 5 yards.
+Reference: NFHS 7-2-6, 7-2-7.

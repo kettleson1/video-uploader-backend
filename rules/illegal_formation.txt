@@ -1,0 +1,3 @@
+Illegal Formation: Improper alignment at the snap (e.g., fewer than 7 on the line, covered/uncovered issues).
+Penalty: Loss of 5 yards.
+Reference: NFHS 7-2-1, 7-2-2, 7-2-3.

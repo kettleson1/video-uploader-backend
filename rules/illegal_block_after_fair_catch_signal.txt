@@ -1,0 +1,3 @@
+Illegal Block After Fair-Catch Signal: Blocking after a valid or invalid fair-catch signal when such contact is prohibited.
+Penalty: Loss of 15 yards.
+Reference: NFHS 6-5-1, 9-3-3.

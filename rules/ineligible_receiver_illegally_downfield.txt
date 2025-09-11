@@ -1,0 +1,3 @@
+Ineligible Receiver Illegally Downfield: Ineligible offensive player is beyond the expanded neutral zone on a forward pass play.
+Penalty: Loss of 5 yards.
+Reference: NFHS 7-5-12.

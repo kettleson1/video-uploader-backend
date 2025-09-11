@@ -1,0 +1,3 @@
+Nonplayer Illegally on Field: Nonplayer is illegally on the field during active play.
+Penalty: Loss of 15 yards.
+Reference: NFHS 9-8-3.

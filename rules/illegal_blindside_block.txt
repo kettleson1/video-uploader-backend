@@ -1,0 +1,3 @@
+Illegal Blindside Block: Block delivered with forceful contact to a blindside opponent outside the player's field of vision.
+Penalty: Loss of 15 yards.
+Reference: NFHS 9-4-3n.

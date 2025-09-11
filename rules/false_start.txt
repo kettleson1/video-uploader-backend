@@ -1,0 +1,3 @@
+False Start: Offensive player abruptly moves or simulates the start of the play before the snap.
+Penalty: Loss of 5 yards.
+Reference: NFHS 7-1-7.

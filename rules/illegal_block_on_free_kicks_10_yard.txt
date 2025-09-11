@@ -1,0 +1,3 @@
+Illegal Block on Free Kicks (10-yard): Illegal block during a free kick situation.
+Penalty: Loss of 10 yards.
+Reference: NFHS 9-3-7.

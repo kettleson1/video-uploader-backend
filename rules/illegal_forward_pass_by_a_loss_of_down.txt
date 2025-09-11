@@ -1,0 +1,3 @@
+Illegal Forward Pass (by A; Loss of Down): A forward pass thrown illegally by Team A (e.g., beyond the LOS after change).
+Penalty: Loss of 5 yards and loss of down.
+Reference: NFHS 7-5-2.

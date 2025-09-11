@@ -1,0 +1,2 @@
+Offside: A player is beyond the neutral zone at the snap. Any part of the body breaking the neutral zone plane before the snap constitutes offside. If contact is made or the play continues, the foul stands.
+Key checks: neutral zone alignment, timing at snap.
