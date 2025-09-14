@@ -18,6 +18,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy import text as sqltext   # <-- use this everywhere you need raw SQL
 from openai import OpenAI
+from sqlalchemy import text as sqltext
 
 from models import Upload  # your SQLAlchemy model
 
@@ -111,6 +112,11 @@ def _extract_frames(video_bytes: bytes, fps: int = 1, max_frames: int = 6) -> Li
                 frames.append(pf.read())
     return frames
 
+def _title_to_label(name: str) -> str:
+    # rules filenames like "roughing_the_passer.txt" -> "Roughing The Passer"
+    base = name.rsplit(".", 1)[0]
+    return " ".join(w.capitalize() for w in base.split("_"))
+
 def _summarize_frames(frames: List[bytes]) -> str:
     """
     Vision summary using GPT-4o-mini: send 2–3 frames as data URLs with a concise prompt.
@@ -196,40 +202,58 @@ def _retrieve_rules(summary: str, top_k: int = 3):
         }
         for r in rows
     ]
-def _decide_label(summary: str, retrieved: List[dict]) -> tuple[str, float, str]:
+def _decide_label(summary: str, retrieved_rules: list[dict]) -> tuple[str, float, str]:
     """
-    Ask the model for a foul label + 0–1 confidence + short explanation grounded in retrieved rules.
+    Given the clip summary and retrieved rules, ask the model for:
+      - label: one of the rule labels (prefer retrieved), or 'None'
+      - confidence: 0.00-1.00
+      - explanation: 1-3 sentences with short citations like [title].
     """
-    rules_text = "\n\n".join(
-        f"[{i+1}] {r['title']} {r.get('section','')}\n{r['body']}"
-        for i, r in enumerate(retrieved)
-    ) or "(no rules retrieved)"
+    # Build a compact context with cite handles
+    context_chunks = []
+    for r in retrieved_rules:
+        title = str(r.get("title") or "").replace(".txt", "")
+        body = str(r.get("body") or "")
+        context_chunks.append(f"[{title}] {body}")
 
-    prompt = (
-        "You are an NCAA football rules analyst. Given the play summary and rule snippets, "
-        "choose the most likely foul label from: "
-        "['False Start','Offside','Holding','Pass Interference','Targeting','None'].\n"
-        "Return JSON with keys: label (string), confidence (0..1), explanation (<=2 sentences).\n\n"
-        f"Play summary:\n{summary}\n\nRules:\n{rules_text}"
+    context_text = "\n\n".join(context_chunks) if context_chunks else "No rules retrieved."
+
+    system_msg = (
+        "You are a high school football rules assistant. "
+        "Decide the most likely foul label from the provided rules. "
+        "If no foul fits, return 'None'. Confidence is 0.00-1.00."
+    )
+    user_msg = (
+        f"Clip summary:\n{summary}\n\n"
+        f"Relevant rules:\n{context_text}\n\n"
+        "Return JSON with keys: label (string), confidence (float), explanation (string). "
+        "Use cite-like markers [RuleName] in the explanation when you reference a rule."
     )
 
     resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.1,
-        response_format={"type": "json_object"},
+        model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        messages=[
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg},
+        ],
+        temperature=0.2,
     )
-    raw = resp.choices[0].message.content or "{}"
-    import json
-    try:
-        js = json.loads(raw)
-        label = str(js.get("label") or "None")
-        conf = float(js.get("confidence") or 0.5)
-        expl = str(js.get("explanation") or "")
-    except Exception:
-        label, conf, expl = "None", 0.5, "Model output was not valid JSON."
 
-    return label, conf, expl
+    import json
+    content = (resp.choices[0].message.content or "").strip()
+    # Be defensive about JSON parsing
+    label, confidence, explanation = "None", 0.8, "No structured response."
+    try:
+        data = json.loads(content)
+        if isinstance(data, dict):
+            label = str(data.get("label", label))
+            confidence = float(data.get("confidence", confidence))
+            explanation = str(data.get("explanation", explanation))
+    except Exception:
+        # fallback: keep defaults but include raw text for debugging
+        explanation = f"{explanation} Raw: {content[:500]}"
+
+    return label, confidence, explanation
 # =============================================================================
 # Background worker
 # =============================================================================
@@ -360,6 +384,25 @@ def list_recent_plays(limit: int = Query(25, ge=1, le=200)) -> List[dict]:
         return out
     finally:
         db.close()
+
+@app.get("/api/rules/list")
+def list_rules():
+    """
+    Returns an alphabetized list of available rule names from the rules table.
+    Each item has {value, label} where value is the filename and label is human-readable.
+    """
+    try:
+        with engine.begin() as conn:
+            rows = conn.execute(sqltext("""
+                SELECT DISTINCT title
+                FROM rules
+                WHERE title IS NOT NULL AND title <> ''
+                ORDER BY title ASC
+            """)).fetchall()
+        out = [{"value": r[0], "label": _title_to_label(r[0])} for r in rows]
+        return out
+    except Exception as e:
+        return {"error": str(e)}
 
 @app.post("/api/retry/{upload_id}")
 def retry_upload(upload_id: int):
