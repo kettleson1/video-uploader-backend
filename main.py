@@ -1,189 +1,167 @@
 import os
 import re
 import io
+import json
 import base64
 import tempfile
 import subprocess
 from datetime import datetime, timezone
 from typing import List, Optional
 
-from dotenv import load_dotenv
-load_dotenv()  # so .env is picked up for DATABASE_URL, OPENAI_API_KEY, etc.
-
 import boto3
-from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, Query
+from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, Session
-from sqlalchemy import text as sqltext   # <-- use this everywhere you need raw SQL
-from openai import OpenAI
 from sqlalchemy import text as sqltext
+from openai import OpenAI
 
-from models import Upload  # your SQLAlchemy model
+from models import Upload  # must include retrieved_rules, human_label, human_notes, reviewed_at
 
-# =============================================================================
-# Config
-# =============================================================================
-DATABASE_URL   = os.getenv("DATABASE_URL")
-AWS_REGION     = os.getenv("AWS_REGION", "us-east-2")
-BUCKET_NAME    = os.getenv("AWS_S3_BUCKET")
+# ------------------------------------------------------------------------------
+# Environment / Clients
+# ------------------------------------------------------------------------------
+AWS_REGION = os.getenv("AWS_REGION", "us-east-2")
+BUCKET_NAME = os.getenv("AWS_S3_BUCKET")
+DATABASE_URL = os.getenv("DATABASE_URL")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
-# confidence threshold (default 0.60)
+OPENAI_EMBED_MODEL = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-large")  # 3072-D
 CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.60"))
 
-assert DATABASE_URL,   "DATABASE_URL not set"
-assert BUCKET_NAME,    "AWS_S3_BUCKET not set"
-assert OPENAI_API_KEY, "OPENAI_API_KEY not set"
-
-# --- Option B: keep 3072-D embeddings ---------------------------------------
-EMBED_MODEL = "text-embedding-3-large"  # 3072-dim
-EMBED_DIM   = 3072
-
-# =============================================================================
-# Clients
-# =============================================================================
-engine = create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+if not (BUCKET_NAME and DATABASE_URL and OPENAI_API_KEY):
+    raise RuntimeError("Missing required env vars: AWS_S3_BUCKET, DATABASE_URL, OPENAI_API_KEY")
 
 s3_client = boto3.client("s3", region_name=AWS_REGION)
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# =============================================================================
-# App
-# =============================================================================
-app = FastAPI(title="Video Uploader Backend (RAG 3072D)")
+# ------------------------------------------------------------------------------
+# FastAPI
+# ------------------------------------------------------------------------------
+app = FastAPI(title="Video Uploader RAG Backend")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # tighten in prod
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# =============================================================================
+# ------------------------------------------------------------------------------
+# Schemas
+# ------------------------------------------------------------------------------
+class UploadResponse(BaseModel):
+    id: int
+    s3_url: str
+
+# ------------------------------------------------------------------------------
 # Helpers
-# =============================================================================
-def _now_utc() -> datetime:
+# ------------------------------------------------------------------------------
+def _now_utc():
     return datetime.now(timezone.utc)
 
-def _safe_err_text(err: Exception) -> str:
-    """Always store a string in DB error_message."""
+def _safe_err_text(e: Exception) -> str:
     try:
-        return str(err)
+        return str(e)
     except Exception:
-        return "Unhandled error"
+        return "Unknown error"
 
 def _s3_key_from_url(url: str) -> str:
-    from urllib.parse import urlparse
-    p = urlparse(url)
-    return p.path[1:] if p.path.startswith("/") else p.path
+    # https://bucket.s3.region.amazonaws.com/<key>
+    return url.split(".amazonaws.com/")[-1]
 
-def _presign(key: str, expires: int = 3600) -> str:
-    return s3_client.generate_presigned_url(
-        ClientMethod="get_object",
-        Params={"Bucket": BUCKET_NAME, "Key": key},
-        ExpiresIn=expires,
-    )
+def _presign(key: str, expires: int = 3600) -> Optional[str]:
+    try:
+        return s3_client.generate_presigned_url(
+            ClientMethod="get_object",
+            Params={"Bucket": BUCKET_NAME, "Key": key},
+            ExpiresIn=expires,
+        )
+    except Exception:
+        return None
 
-def _extract_frames(video_bytes: bytes, fps: int = 1, max_frames: int = 6) -> List[bytes]:
+def _extract_frames(video_bytes: bytes, fps: int = 1, max_frames: int = 6) -> List[str]:
     """
-    Use ffmpeg to sample up to `max_frames` PNG frames at `fps`.
-    Returns raw PNG bytes for each extracted frame.
+    Return a list of base64-encoded JPEG frames (strings).
     """
-    frames: List[bytes] = []
+    frames_b64: List[str] = []
     with tempfile.TemporaryDirectory() as td:
-        in_path = os.path.join(td, "clip.mp4")
-        with open(in_path, "wb") as f:
+        src = os.path.join(td, "in.mp4")
+        with open(src, "wb") as f:
             f.write(video_bytes)
-
-        out_pattern = os.path.join(td, "f_%03d.png")
+        out_tpl = os.path.join(td, "frame_%04d.jpg")
+        # extract jpg frames
         cmd = [
-            "ffmpeg", "-hide_banner", "-loglevel", "error",
-            "-i", in_path, "-vf", f"fps={fps}",
-            "-frames:v", str(max_frames),
-            out_pattern,
+            "ffmpeg", "-y",
+            "-i", src,
+            "-vf", f"fps={fps}",
+            "-q:v", "2",
+            out_tpl
         ]
-        subprocess.run(cmd, check=True)
+        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        # load up to max_frames
+        for name in sorted(os.listdir(td)):
+            if not name.lower().endswith(".jpg"):
+                continue
+            if len(frames_b64) >= max_frames:
+                break
+            p = os.path.join(td, name)
+            with open(p, "rb") as jf:
+                b64 = base64.b64encode(jf.read()).decode("utf-8")  # defensive: return str
+                frames_b64.append(b64)
+    return frames_b64
 
-        for name in sorted(p for p in os.listdir(td) if p.startswith("f_") and p.endswith(".png")):
-            with open(os.path.join(td, name), "rb") as pf:
-                frames.append(pf.read())
-    return frames
-
-def _title_to_label(name: str) -> str:
-    # rules filenames like "roughing_the_passer.txt" -> "Roughing The Passer"
-    base = name.rsplit(".", 1)[0]
-    return " ".join(w.capitalize() for w in base.split("_"))
-
-def _summarize_frames(frames: List[bytes]) -> str:
+def _summarize_frames(frames_b64: List[str]) -> str:
     """
-    Vision summary using GPT-4o-mini: send 2–3 frames as data URLs with a concise prompt.
+    Summarize the play from a handful of frames.
     """
-    if not frames:
-        return "No visual content extracted."
+    if not frames_b64:
+        return "No visual context available."
 
-    pick = frames[:3]
-    content: List[dict] = [
-        {"type": "text",
-         "text": (
-             "You are an analyst for NCAA football officiating. "
-             "Summarize what happens in these frames (players, ball, snap/LOS, contact, likely fouls) "
-             "in 3–5 concise bullet points."
-         )}
-    ]
-    for b in pick:
-        # Ensure base64 is a *string*
-        b64 = base64.b64encode(b).decode("utf-8")
-        content.append({
-            "type": "image_url",
-            "image_url": {"url": f"data:image/png;base64,{b64}"}
-        })
-
-    chat = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": content}],
-        temperature=0.2,
+    # Build a minimal text prompt (we’re not using image inputs here)
+    prompt = (
+        "You are an assistant that writes a concise description of a football play "
+        "from a few snapshots. Mention formation/positions, motion, snap, contact, "
+        "and any obvious infractions if clearly visible. Keep it under ~70 words."
     )
-    return chat.choices[0].message.content or "No summary."
+    # We only send text; frames are extracted for potential future use with vision models.
+    msg = f"{prompt}\n\nFrames extracted: {len(frames_b64)} representative images (not attached)."
 
-def _embed_text(text_: str) -> List[float]:
-    """
-    Create a 3072-D embedding, defensively padding/trimming to EMBED_DIM.
-    """
-    text_ = (text_ or "").strip()
-    if not text_:
-        return [0.0] * EMBED_DIM
+    # Use a lightweight model for cost/speed; adjust if you prefer.
+    chat = client.chat.completions.create(
+        model=os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini"),
+        messages=[{"role": "user", "content": msg}],
+        temperature=0.2,
+        max_tokens=140,
+    )
+    return (chat.choices[0].message.content or "").strip()
 
-    vec = client.embeddings.create(model=EMBED_MODEL, input=text_).data[0].embedding
-    if len(vec) != EMBED_DIM:
-        if len(vec) > EMBED_DIM:
-            vec = vec[:EMBED_DIM]
-        else:
-            vec = vec + [0.0] * (EMBED_DIM - len(vec))
-    return vec
-
-def _retrieve_rules(summary: str, top_k: int = 3):
+def _embed_text(text_in: str) -> List[float]:
     """
-    Embed the summary and retrieve the closest rule chunks via pgvector.
-    Uses cosine distance. The embedding column is vector(3072).
+    Create a 3072-D embedding (text-embedding-3-large).
     """
-    # 1) Make a 3072-D embedding
-    emb = _embed_text(summary)  # must be length 3072
-    # (optional sanity) assert len(emb) == 3072, f"Expected 3072-d emb, got {len(emb)}"
+    resp = client.embeddings.create(model=OPENAI_EMBED_MODEL, input=text_in)
+    vec = resp.data[0].embedding
+    return [float(x) for x in vec]
 
-    # 2) Build a pgvector literal: "[0.123,0.456,...]"
+def _retrieve_rules(summary: str, top_k: int = 3) -> List[dict]:
+    """
+    Retrieve closest rule chunks via pgvector (cosine).
+    Column type: vector(3072)
+    """
+    emb = _embed_text(summary)  # 3072-D
     qvec_literal = "[" + ",".join(f"{x:.6f}" for x in emb) + "]"
 
-    # 3) Query with proper casting and bound params
     sql = sqltext("""
         SELECT
             id,
             title,
             section,
             body,
-            1 - (embedding <=> (:qvec)::vector) AS score  -- cosine similarity
+            1 - (embedding <=> (:qvec)::vector) AS score
         FROM rules
         ORDER BY embedding <=> (:qvec)::vector
         LIMIT :k
@@ -192,71 +170,68 @@ def _retrieve_rules(summary: str, top_k: int = 3):
     with engine.begin() as conn:
         rows = conn.execute(sql, {"qvec": qvec_literal, "k": top_k}).mappings().all()
 
-    return [
-        {
-            "id": r["id"],
+    # Make sure everything is JSON-serializable (no Decimals)
+    out = []
+    for r in rows:
+        out.append({
+            "id": int(r["id"]),
             "title": r["title"],
             "section": r["section"],
             "body": r["body"],
             "score": float(r["score"]) if r["score"] is not None else None,
-        }
-        for r in rows
-    ]
-def _decide_label(summary: str, retrieved_rules: list[dict]) -> tuple[str, float, str]:
+        })
+    return out
+
+def _predict_with_rules(summary: str, retrieved: list[dict]) -> tuple[str, float, str]:
     """
-    Given the clip summary and retrieved rules, ask the model for:
-      - label: one of the rule labels (prefer retrieved), or 'None'
-      - confidence: 0.00-1.00
-      - explanation: 1-3 sentences with short citations like [title].
+    Use LLM to choose a label and produce confidence + explanation.
+    Returned: (label, confidence[0..1], explanation)
     """
-    # Build a compact context with cite handles
-    context_chunks = []
-    for r in retrieved_rules:
-        title = str(r.get("title") or "").replace(".txt", "")
-        body = str(r.get("body") or "")
-        context_chunks.append(f"[{title}] {body}")
+    # Build rule snippets text safely (avoid nested quotes in f-strings)
+    parts: list[str] = []
+    for r in (retrieved or []):
+        title = str(r.get("title", ""))
+        section = r.get("section")
+        section_str = f" ({section})" if section else ""
+        body = str(r.get("body", ""))
+        parts.append(f"- {title}{section_str}\n{body}")
+    rules_snips = "\n\n".join(parts).strip() or "No matching rule snippets."
 
-    context_text = "\n\n".join(context_chunks) if context_chunks else "No rules retrieved."
-
-    system_msg = (
-        "You are a high school football rules assistant. "
-        "Decide the most likely foul label from the provided rules. "
-        "If no foul fits, return 'None'. Confidence is 0.00-1.00."
+    sys_prompt = (
+        "You are a high school football rule assistant. "
+        "Given a short play summary and a few rule snippets, choose the most likely foul label "
+        "from the snippets (or 'None' if no foul). Provide a numeric confidence in [0,1] "
+        "and a 1-2 sentence explanation grounded in the snippets."
     )
-    user_msg = (
-        f"Clip summary:\n{summary}\n\n"
-        f"Relevant rules:\n{context_text}\n\n"
-        "Return JSON with keys: label (string), confidence (float), explanation (string). "
-        "Use cite-like markers [RuleName] in the explanation when you reference a rule."
+    user_prompt = (
+        f"PLAY SUMMARY:\n{summary}\n\n"
+        f"CANDIDATE RULE SNIPPETS:\n{rules_snips}\n\n"
+        "Respond as JSON with keys: label, confidence, explanation."
     )
 
-    resp = client.chat.completions.create(
-        model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+    chat = client.chat.completions.create(
+        model=os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini"),
         messages=[
-            {"role": "system", "content": system_msg},
-            {"role": "user", "content": user_msg},
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": user_prompt},
         ],
-        temperature=0.2,
+        temperature=0.1,
+        max_tokens=220,
     )
+    txt = (chat.choices[0].message.content or "").strip()
 
-    import json
-    content = (resp.choices[0].message.content or "").strip()
-    # Be defensive about JSON parsing
-    label, confidence, explanation = "None", 0.8, "No structured response."
+    label, conf, expl = "None", 0.8, "No clear foul per snippets."
     try:
-        data = json.loads(content)
-        if isinstance(data, dict):
-            label = str(data.get("label", label))
-            confidence = float(data.get("confidence", confidence))
-            explanation = str(data.get("explanation", explanation))
+        j = json.loads(txt)
+        label = str(j.get("label", "None"))
+        conf = float(j.get("confidence", 0.8))
+        expl = str(j.get("explanation", "")) or expl
     except Exception:
-        # fallback: keep defaults but include raw text for debugging
-        explanation = f"{explanation} Raw: {content[:500]}"
-
-    return label, confidence, explanation
-# =============================================================================
+        pass
+    return label, conf, expl
+# ------------------------------------------------------------------------------
 # Background worker
-# =============================================================================
+# ------------------------------------------------------------------------------
 def _process_upload_bg(upload_id: int, s3_url: str, foul_hint: str):
     db: Session = SessionLocal()
     try:
@@ -269,47 +244,42 @@ def _process_upload_bg(upload_id: int, s3_url: str, foul_hint: str):
         frames = _extract_frames(video_bytes, fps=1, max_frames=6)
         summary = _summarize_frames(frames)
 
-        # 3) Retrieve rules + 4) Decide
+        # 3) Retrieve rules
         retrieved = _retrieve_rules(summary, top_k=3)
-        label, conf, expl = _decide_label(summary, retrieved)
 
-        # --- Confidence thresholding ---
+        # 4) Decide with LLM
+        label, confidence, explanation_text = _predict_with_rules(summary, retrieved)
+
+        # 4b) Confidence thresholding
         final_label = label
-        final_conf = float(conf or 0.0)
+        final_conf = float(confidence)
         if final_conf < CONFIDENCE_THRESHOLD:
             final_label = "Uncertain"
 
-        # 5) Update DB
-        row = db.get(Upload, upload_id)  # works on SQLAlchemy 1.4/2.x
+        # 5) Update DB (also SAVE retrieved_rules)
+        row = db.query(Upload).get(upload_id)
         if row:
             row.status = "done"
             row.prediction_label = final_label
             row.confidence = final_conf
-            row.explanation = expl
+            row.explanation = explanation_text
             row.processed_at = _now_utc()
             row.error_message = None
+            row.retrieved_rules = retrieved  # <--- store JSON for rules drawer
             db.commit()
-
     except Exception as e:
-        # Defensive: stringify any error
-        row = db.get(Upload, upload_id)
+        row = db.query(Upload).get(upload_id)
         if row:
             row.status = "error"
-            row.error_message = _safe_err_text(e)
+            row.error_message = _safe_err_text(e)  # stringify error
             row.processed_at = _now_utc()
             db.commit()
     finally:
         db.close()
-# =============================================================================
-# Schemas
-# =============================================================================
-class UploadResponse(BaseModel):
-    id: int
-    s3_url: str
 
-# =============================================================================
+# ------------------------------------------------------------------------------
 # Routes
-# =============================================================================
+# ------------------------------------------------------------------------------
 @app.get("/health")
 def health():
     return {"ok": True}
@@ -323,7 +293,7 @@ async def upload_video(
 ):
     data = await file.read()
 
-    # Clean filename (no spaces / weird chars)
+    # Clean filename
     clean_name = re.sub(r"[^A-Za-z0-9._-]+", "_", file.filename or "clip.mp4")
     stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S%fZ")
     key = f"videos/{stamp}_{clean_name}"
@@ -355,6 +325,9 @@ async def upload_video(
 
 @app.get("/api/plays")
 def list_recent_plays(limit: int = Query(25, ge=1, le=200)) -> List[dict]:
+    """
+    Include retrieved_rules so the UI can open a drawer without another fetch.
+    """
     db: Session = SessionLocal()
     try:
         rows = (
@@ -378,31 +351,16 @@ def list_recent_plays(limit: int = Query(25, ge=1, le=200)) -> List[dict]:
                 "processed_at": r.processed_at.isoformat() if r.processed_at else None,
                 "error_message": r.error_message,
                 "explanation": getattr(r, "explanation", None),
+                "retrieved_rules": getattr(r, "retrieved_rules", None),  # <--- included
+                "human_label": getattr(r, "human_label", None),
+                "human_notes": getattr(r, "human_notes", None),
+                "reviewed_at": r.reviewed_at.isoformat() if getattr(r, "reviewed_at", None) else None,
                 "s3_url": r.s3_url,
                 "presigned_url": presigned,
             })
         return out
     finally:
         db.close()
-
-@app.get("/api/rules/list")
-def list_rules():
-    """
-    Returns an alphabetized list of available rule names from the rules table.
-    Each item has {value, label} where value is the filename and label is human-readable.
-    """
-    try:
-        with engine.begin() as conn:
-            rows = conn.execute(sqltext("""
-                SELECT DISTINCT title
-                FROM rules
-                WHERE title IS NOT NULL AND title <> ''
-                ORDER BY title ASC
-            """)).fetchall()
-        out = [{"value": r[0], "label": _title_to_label(r[0])} for r in rows]
-        return out
-    except Exception as e:
-        return {"error": str(e)}
 
 @app.post("/api/retry/{upload_id}")
 def retry_upload(upload_id: int):
@@ -417,23 +375,23 @@ def retry_upload(upload_id: int):
         row.processed_at = None
         db.commit()
 
-        # Run synchronously here; for production use a background queue/worker
+        # Run synchronously here; in prod use a queue/worker
         _process_upload_bg(upload_id=row.id, s3_url=row.s3_url, foul_hint=row.foul_type)
         return {"ok": True, "id": upload_id}
     finally:
         db.close()
 
+# ------------------------------------------------------------------------------
+# Rules: quick search (already handy for sanity checks)
+# ------------------------------------------------------------------------------
 @app.get("/api/rules/search")
 def search_rules(q: str = Query(..., min_length=2), k: int = Query(3, ge=1, le=10)):
     """
-    Quick retrieval endpoint to sanity-check embeddings & pgvector search.
-    Returns top-K rule chunks for the given free-text query.
+    Simple retrieval endpoint to sanity-check embeddings & pgvector search.
     """
     try:
-        emb = _embed_text(q)  # should be 3072-D for text-embedding-3-large
-        # vector literal: "[0.1,0.2,...]"
-        qvec_literal = "[" + ",".join(f"{x:.6f}" for x in emb) + "]"  # ensure string
-
+        emb = _embed_text(q)  # 3072-D
+        qvec_literal = "[" + ",".join(f"{x:.6f}" for x in emb) + "]"
         sql = sqltext("""
             SELECT id, title, section, body,
                    1 - (embedding <=> (:qvec)::vector) AS score
@@ -441,13 +399,11 @@ def search_rules(q: str = Query(..., min_length=2), k: int = Query(3, ge=1, le=1
             ORDER BY embedding <=> (:qvec)::vector
             LIMIT :k
         """)
-
         with engine.begin() as conn:
             rows = conn.execute(sql, {"qvec": qvec_literal, "k": k}).mappings().all()
-
         return [
             {
-                "id": r["id"],
+                "id": int(r["id"]),
                 "title": r["title"],
                 "section": r["section"],
                 "score": float(r["score"]) if r["score"] is not None else None,
@@ -456,5 +412,55 @@ def search_rules(q: str = Query(..., min_length=2), k: int = Query(3, ge=1, le=1
             for r in rows
         ]
     except Exception as e:
-        # Defensive: always stringify errors
         return {"error": str(e)}
+
+# ------------------------------------------------------------------------------
+# 1.e Human review route
+# ------------------------------------------------------------------------------
+class ReviewIn(BaseModel):
+    human_label: Optional[str] = None
+    human_notes: Optional[str] = None
+    # Optional: allow overriding prediction_label/confidence if you want
+    override_prediction: Optional[bool] = False
+
+@app.post("/api/review/{upload_id}")
+def submit_review(upload_id: int, payload: ReviewIn = Body(...)):
+    """
+    Save human review info. If override_prediction=True and human_label is provided,
+    copy human_label into prediction_label.
+    """
+    db: Session = SessionLocal()
+    try:
+        row = db.query(Upload).get(upload_id)
+        if not row:
+            return {"ok": False, "error": "Not found"}
+
+        row.human_label = payload.human_label
+        row.human_notes = payload.human_notes
+        row.reviewed_at = _now_utc()
+
+        if payload.override_prediction and payload.human_label:
+            row.prediction_label = payload.human_label
+
+        db.commit()
+        return {"ok": True, "id": upload_id}
+    except Exception as e:
+        return {"ok": False, "error": _safe_err_text(e)}
+    finally:
+        db.close()
+
+# ------------------------------------------------------------------------------
+# (Optional) list rules for populating UI dropdowns
+# ------------------------------------------------------------------------------
+@app.get("/api/rules/list")
+def list_rules_for_ui():
+    """
+    Lists all rule files we ingested (by title). Useful for building UI pickers.
+    """
+    sql = sqltext("SELECT DISTINCT title FROM rules ORDER BY title ASC")
+    with engine.begin() as conn:
+        rows = conn.execute(sql).all()
+    def friendly(name: str) -> str:
+        base = name.replace(".txt", "")
+        return " ".join(w.capitalize() for w in re.split(r"[_\-]+", base))
+    return [{"value": r[0], "label": friendly(r[0])} for r in rows]
