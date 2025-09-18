@@ -18,6 +18,8 @@ from sqlalchemy import text as sqltext
 from openai import OpenAI
 
 from models import Upload  # must include retrieved_rules, human_label, human_notes, reviewed_at
+from dotenv import load_dotenv
+load_dotenv()
 
 # ------------------------------------------------------------------------------
 # Environment / Clients
@@ -56,6 +58,11 @@ app.add_middleware(
 class UploadResponse(BaseModel):
     id: int
     s3_url: str
+
+class ReviewPayload(BaseModel):
+    human_label: Optional[str] = None
+    human_notes: Optional[str] = None
+    reviewed: bool = False
 
 # ------------------------------------------------------------------------------
 # Helpers
@@ -380,6 +387,29 @@ def retry_upload(upload_id: int):
         return {"ok": True, "id": upload_id}
     finally:
         db.close()
+
+@app.patch("/api/plays/{upload_id}/review")
+def set_human_review(upload_id: int, payload: ReviewPayload):
+    db: Session = SessionLocal()
+    try:
+        row = db.query(Upload).get(upload_id)
+        if not row:
+            return {"ok": False, "error": "Not found"}
+
+        if payload.reviewed:
+            row.human_label = payload.human_label
+            row.human_notes = payload.human_notes
+            row.reviewed_at = datetime.now(timezone.utc)
+        else:
+            row.human_label = None
+            row.human_notes = None
+            row.reviewed_at = None
+
+        db.commit()
+        return {"ok": True, "id": upload_id}
+    finally:
+        db.close()
+
 
 # ------------------------------------------------------------------------------
 # Rules: quick search (already handy for sanity checks)
