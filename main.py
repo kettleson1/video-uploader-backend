@@ -369,6 +369,10 @@ def list_recent_plays(limit: int = Query(25, ge=1, le=200)) -> List[dict]:
     finally:
         db.close()
 
+@app.get("/health")
+def health_check():
+    return {"status": "ok"}
+
 @app.post("/api/retry/{upload_id}")
 def retry_upload(upload_id: int):
     db: Session = SessionLocal()
