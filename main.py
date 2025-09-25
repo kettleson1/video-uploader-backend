@@ -21,6 +21,8 @@ from models import Upload  # must include retrieved_rules, human_label, human_no
 from dotenv import load_dotenv
 load_dotenv()
 
+from fastapi.middleware.cors import CORSMiddleware
+
 # ------------------------------------------------------------------------------
 # Environment / Clients
 # ------------------------------------------------------------------------------
@@ -42,11 +44,11 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 # ------------------------------------------------------------------------------
 # FastAPI
 # ------------------------------------------------------------------------------
-app = FastAPI(title="Video Uploader RAG Backend")
+app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten in prod
+    allow_origins=["http://localhost:3000"],  # 👈 React dev server
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
