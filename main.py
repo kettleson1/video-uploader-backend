@@ -23,6 +23,7 @@ load_dotenv()
 
 from fastapi.middleware.cors import CORSMiddleware
 
+
 # ------------------------------------------------------------------------------
 # Environment / Clients
 # ------------------------------------------------------------------------------
@@ -301,6 +302,25 @@ async def upload_video(
     notes: str = Form(""),
 ):
     data = await file.read()
+    
+    # ---- Human Review API ----
+class ReviewIn(BaseModel):
+    label: str
+    notes: str | None = None
+
+@app.post("/api/plays/{upload_id}/label")
+def label_play(upload_id: int, payload: ReviewIn):
+    db = SessionLocal()
+    row = db.query(Upload).get(upload_id)
+    if not row:
+        return {"ok": False, "error": "Not found"}
+
+    row.human_label = payload.label
+    row.human_notes = payload.notes
+    row.reviewed_at = datetime.utcnow()
+    db.commit()
+
+    return {"ok": True}
 
     # Clean filename
     clean_name = re.sub(r"[^A-Za-z0-9._-]+", "_", file.filename or "clip.mp4")
