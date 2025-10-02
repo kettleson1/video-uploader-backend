@@ -294,7 +294,7 @@ def _process_upload_bg(upload_id: int, s3_url: str, foul_hint: str):
 def health():
     return {"ok": True}
 
-@app.post("/upload", response_model=UploadResponse)
+@app.post("/upload")
 async def upload_video(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
@@ -308,27 +308,37 @@ class ReviewIn(BaseModel):
     label: str
     notes: str | None = None
 
-@app.post("/api/plays/{upload_id}/label")
-def label_play(upload_id: int, payload: ReviewIn):
-    db = SessionLocal()
-    row = db.query(Upload).get(upload_id)
-    if not row:
-        return {"ok": False, "error": "Not found"}
-
-    row.human_label = payload.label
-    row.human_notes = payload.notes
-    row.reviewed_at = datetime.utcnow()
-    db.commit()
-
-    return {"ok": True}
+@app.post("/upload", response_model=UploadResponse)
+async def upload_video(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    foul_type: str = Form(...),
+    notes: str = Form(""),
+):
+    data = await file.read()
 
     # Clean filename
     clean_name = re.sub(r"[^A-Za-z0-9._-]+", "_", file.filename or "clip.mp4")
     stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S%fZ")
     key = f"videos/{stamp}_{clean_name}"
 
-    # Upload to S3
-    s3_client.put_object(Bucket=BUCKET_NAME, Key=key, Body=data, ContentType="video/mp4")
+    # Debug logging
+    print("📦 Starting upload to S3...")
+    print("👉 Bucket:", BUCKET_NAME)
+    print("👉 S3 Key:", key)
+
+    try:
+        s3_client.put_object(
+            Bucket=BUCKET_NAME,
+            Key=key,
+            Body=data,
+            ContentType="video/mp4"
+        )
+        print(f"✅ Uploaded to S3 as: {key}")
+    except Exception as e:
+        print(f"❌ S3 upload failed: {e}")
+        raise e
+
     s3_url = f"https://{BUCKET_NAME}.s3.{AWS_REGION}.amazonaws.com/{key}"
 
     # Create DB row
@@ -351,7 +361,7 @@ def label_play(upload_id: int, payload: ReviewIn):
         return UploadResponse(id=rec.id, s3_url=s3_url)
     finally:
         db.close()
-
+        
 @app.get("/api/plays")
 def list_recent_plays(limit: int = Query(25, ge=1, le=200)) -> List[dict]:
     """
