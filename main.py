@@ -322,23 +322,8 @@ async def upload_video(
     stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S%fZ")
     key = f"videos/{stamp}_{clean_name}"
 
-    # Debug logging
-    print("📦 Starting upload to S3...")
-    print("👉 Bucket:", BUCKET_NAME)
-    print("👉 S3 Key:", key)
-
-    try:
-        s3_client.put_object(
-            Bucket=BUCKET_NAME,
-            Key=key,
-            Body=data,
-            ContentType="video/mp4"
-        )
-        print(f"✅ Uploaded to S3 as: {key}")
-    except Exception as e:
-        print(f"❌ S3 upload failed: {e}")
-        raise e
-
+    # Upload to S3
+    s3_client.put_object(Bucket=BUCKET_NAME, Key=key, Body=data, ContentType="video/mp4")
     s3_url = f"https://{BUCKET_NAME}.s3.{AWS_REGION}.amazonaws.com/{key}"
 
     # Create DB row
@@ -355,10 +340,11 @@ async def upload_video(
         db.commit()
         db.refresh(rec)
 
-        # Kick background
+        # Background processing
         background_tasks.add_task(_process_upload_bg, rec.id, s3_url, foul_type)
 
         return UploadResponse(id=rec.id, s3_url=s3_url)
+
     finally:
         db.close()
         
