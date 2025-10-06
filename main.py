@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from typing import List, Optional
 
 import boto3
-from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, Query, Body
+from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, Query, Body, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import create_engine
@@ -294,15 +294,6 @@ def _process_upload_bg(upload_id: int, s3_url: str, foul_hint: str):
 def health():
     return {"ok": True}
 
-@app.post("/upload")
-async def upload_video(
-    background_tasks: BackgroundTasks,
-    file: UploadFile = File(...),
-    foul_type: str = Form(...),
-    notes: str = Form(""),
-):
-    data = await file.read()
-    
     # ---- Human Review API ----
 class ReviewIn(BaseModel):
     label: str
@@ -315,38 +306,56 @@ async def upload_video(
     foul_type: str = Form(...),
     notes: str = Form(""),
 ):
-    data = await file.read()
+    print("📥 Upload request received")
 
-    # Clean filename
-    clean_name = re.sub(r"[^A-Za-z0-9._-]+", "_", file.filename or "clip.mp4")
-    stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S%fZ")
-    key = f"videos/{stamp}_{clean_name}"
-
-    # Upload to S3
-    s3_client.put_object(Bucket=BUCKET_NAME, Key=key, Body=data, ContentType="video/mp4")
-    s3_url = f"https://{BUCKET_NAME}.s3.{AWS_REGION}.amazonaws.com/{key}"
-
-    # Create DB row
-    db: Session = SessionLocal()
     try:
-        rec = Upload(
-            s3_url=s3_url,
-            foul_type=foul_type,
-            notes=notes,
-            timestamp=datetime.utcnow(),
-            status="queued",
-        )
-        db.add(rec)
-        db.commit()
-        db.refresh(rec)
+        data = await file.read()
+        print("✅ File read complete")
 
-        # Background processing
-        background_tasks.add_task(_process_upload_bg, rec.id, s3_url, foul_type)
+        clean_name = re.sub(r"[^A-Za-z0-9._-]+", "_", file.filename or "clip.mp4")
+        stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S%fZ")
+        key = f"videos/{stamp}_{clean_name}"
+        print("🧹 Cleaned filename:", key)
 
-        return UploadResponse(id=rec.id, s3_url=s3_url)
+        # S3 Upload
+        try:
+            s3_client.put_object(Bucket=BUCKET_NAME, Key=key, Body=data, ContentType="video/mp4")
+            print("✅ S3 upload complete")
+        except Exception as e:
+            print("❌ S3 upload failed:", e)
+            raise HTTPException(status_code=500, detail="S3 upload failed")
 
-    finally:
-        db.close()
+        s3_url = f"https://{BUCKET_NAME}.s3.{AWS_REGION}.amazonaws.com/{key}"
+        print("🌐 S3 URL:", s3_url)
+
+        # DB Write
+        db: Session = SessionLocal()
+        try:
+            rec = Upload(
+                s3_url=s3_url,
+                foul_type=foul_type,
+                notes=notes,
+                timestamp=datetime.utcnow(),
+                status="queued",
+            )
+            db.add(rec)
+            db.commit()
+            db.refresh(rec)
+            print("✅ DB write complete with ID:", rec.id)
+
+            background_tasks.add_task(_process_upload_bg, rec.id, s3_url, foul_type)
+            response = UploadResponse(id=rec.id, s3_url=s3_url)
+            print("✅ UploadResponse ready:", response.dict())
+            return response
+        except Exception as db_error:
+            print("❌ DB write failed:", db_error)
+            raise HTTPException(status_code=500, detail="DB write failed")
+        finally:
+            db.close()
+
+    except Exception as e:
+        print("❌ Unexpected error in /upload:", e)
+        raise HTTPException(status_code=500, detail="Unexpected server error")
         
 @app.get("/api/plays")
 def list_recent_plays(limit: int = Query(25, ge=1, le=200)) -> List[dict]:
