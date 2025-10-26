@@ -47,6 +47,17 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 # ------------------------------------------------------------------------------
 app = FastAPI()
 
+@app.get("/api/rules")
+def list_all_rules():
+    rules_dir = os.path.join(os.path.dirname(__file__), "rules")
+    filenames = [
+        os.path.splitext(f)[0].replace("_", " ").title()
+        for f in os.listdir(rules_dir)
+        if f.endswith(".txt")
+    ]
+    return filenames
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # 👈 React dev server
