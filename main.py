@@ -308,7 +308,7 @@ def health():
     # ---- Human Review API ----
 class ReviewIn(BaseModel):
     label: str
-    notes: str | None = None
+    notes: Optional[str] = None
 
 @app.post("/upload", response_model=UploadResponse)
 async def upload_video(
@@ -489,6 +489,8 @@ def search_rules(q: str = Query(..., min_length=2), k: int = Query(3, ge=1, le=1
 # ------------------------------------------------------------------------------
 # 1.e Human review route
 # ------------------------------------------------------------------------------
+from typing import Optional  # Make sure this is imported at the top
+
 class ReviewIn(BaseModel):
     human_label: Optional[str] = None
     human_notes: Optional[str] = None
