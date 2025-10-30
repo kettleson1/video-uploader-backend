@@ -38,7 +38,10 @@ if not (BUCKET_NAME and DATABASE_URL and OPENAI_API_KEY):
     raise RuntimeError("Missing required env vars: AWS_S3_BUCKET, DATABASE_URL, OPENAI_API_KEY")
 
 s3_client = boto3.client("s3", region_name=AWS_REGION)
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+engine = create_engine(
+    "sqlite:///./your_db.db",
+    connect_args={"check_same_thread": False}
+)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 client = OpenAI(api_key=OPENAI_API_KEY)
 
