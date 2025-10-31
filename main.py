@@ -63,7 +63,7 @@ def list_all_rules():
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 👈 React dev server
+    allow_origins=["http://3.135.12.183:3000"],  # 👈 React dev server
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
