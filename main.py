@@ -50,6 +50,14 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 # ------------------------------------------------------------------------------
 app = FastAPI()
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://3.135.12.183:3000"],  # 👈 React dev server
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 @app.get("/api/rules")
 def list_all_rules():
     rules_dir = os.path.join(os.path.dirname(__file__), "rules")
@@ -59,15 +67,6 @@ def list_all_rules():
         if f.endswith(".txt")
     ]
     return filenames
-
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://3.135.12.183:3000"],  # 👈 React dev server
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 # ------------------------------------------------------------------------------
 # Schemas
