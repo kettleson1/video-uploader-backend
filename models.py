@@ -1,9 +1,7 @@
-from sqlalchemy import Column, BigInteger, Text, Float, DateTime
-from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy import Column, BigInteger, Text, Float, DateTime, Integer, String
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy import Column, Integer, String, Text
+from .database import Base   # ✅ Base correctly imported from db setup
 
-Base = declarative_base()
 
 class Upload(Base):
     __tablename__ = "uploads"
@@ -20,18 +18,19 @@ class Upload(Base):
     error_message = Column(Text)
     explanation = Column(Text)
 
-    # New fields for expanded functionality
-    retrieved_rules = Column(JSONB)        # store retrieved rules as JSON array
-    human_label = Column(Text)             # corrected label from human reviewer
-    human_notes = Column(Text)             # optional notes from reviewer
-    reviewed_at = Column(DateTime)         # when human review was applied
-    
+    # New fields supporting human review
+    retrieved_rules = Column(JSONB)
+    human_label = Column(Text)
+    human_notes = Column(Text)
+    reviewed_at = Column(DateTime)
+
+
 class Rule(Base):
     __tablename__ = "rules"
 
     id = Column(Integer, primary_key=True, index=True)
     title = Column(String, index=True)
-    content = Column(Text)  # You may adjust this if you used `description`, etc.
+    content = Column(Text)
 
     def as_dict(self):
         return {
