@@ -1,6 +1,6 @@
 from sqlalchemy import Column, BigInteger, Text, Float, DateTime, Integer, String
 from sqlalchemy.dialects.postgresql import JSONB
-from .database import Base   # ✅ Base correctly imported from db setup
+from database import Base   # ✅ Base correctly imported from db setup
 
 
 class Upload(Base):
