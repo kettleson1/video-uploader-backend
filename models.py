@@ -1,6 +1,7 @@
 from sqlalchemy import Column, BigInteger, Text, Float, DateTime
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy import Column, Integer, String, Text
 
 Base = declarative_base()
 
@@ -24,7 +25,8 @@ class Upload(Base):
     human_label = Column(Text)             # corrected label from human reviewer
     human_notes = Column(Text)             # optional notes from reviewer
     reviewed_at = Column(DateTime)         # when human review was applied
-    class Rule(Base):
+    
+class Rule(Base):
     __tablename__ = "rules"
 
     id = Column(Integer, primary_key=True, index=True)
