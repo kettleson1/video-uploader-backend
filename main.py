@@ -39,9 +39,7 @@ if not (BUCKET_NAME and DATABASE_URL and OPENAI_API_KEY):
 
 s3_client = boto3.client("s3", region_name=AWS_REGION)
 engine = create_engine(
-    "sqlite:///./your_db.db",
-    connect_args={"check_same_thread": False}
-)
+DATABASE_URL)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 client = OpenAI(api_key=OPENAI_API_KEY)
 
