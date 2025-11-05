@@ -7,6 +7,7 @@ import tempfile
 import subprocess
 from datetime import datetime, timezone
 from typing import List, Optional
+from models import Rule
 
 import boto3
 from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, Query, Body, HTTPException
@@ -527,14 +528,7 @@ def submit_review(upload_id: int, payload: ReviewIn = Body(...)):
 # (Optional) list rules for populating UI dropdowns
 # ------------------------------------------------------------------------------
 @app.get("/api/rules/list")
-def list_rules_for_ui():
-    """
-    Lists all rule files we ingested (by title). Useful for building UI pickers.
-    """
-    sql = sqltext("SELECT DISTINCT title FROM rules ORDER BY title ASC")
-    with engine.begin() as conn:
-        rows = conn.execute(sql).all()
-    def friendly(name: str) -> str:
-        base = name.replace(".txt", "")
-        return " ".join(w.capitalize() for w in re.split(r"[_\-]+", base))
-    return [{"value": r[0], "label": friendly(r[0])} for r in rows]
+def get_rules():
+    db = SessionLocal()
+    rules = db.query(Rule).all()
+    return [rule.as_dict() for rule in rules]
