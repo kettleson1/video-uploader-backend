@@ -24,3 +24,16 @@ class Upload(Base):
     human_label = Column(Text)             # corrected label from human reviewer
     human_notes = Column(Text)             # optional notes from reviewer
     reviewed_at = Column(DateTime)         # when human review was applied
+    class Rule(Base):
+    __tablename__ = "rules"
+
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String, index=True)
+    content = Column(Text)  # You may adjust this if you used `description`, etc.
+
+    def as_dict(self):
+        return {
+            "id": self.id,
+            "title": self.title,
+            "content": self.content
+        }

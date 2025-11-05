@@ -7,7 +7,7 @@ import tempfile
 import subprocess
 from datetime import datetime, timezone
 from typing import List, Optional
-from models import Rule
+from models import Upload, Rule
 
 import boto3
 from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, Query, Body, HTTPException
