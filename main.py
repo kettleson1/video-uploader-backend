@@ -14,6 +14,7 @@ from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, Query, Bod
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import create_engine
+from sqlalchemy import select
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy import text as sqltext
 from sqlalchemy.ext.asyncio import AsyncSession
