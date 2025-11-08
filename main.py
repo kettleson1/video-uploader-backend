@@ -10,13 +10,16 @@ from typing import List, Optional
 from models import Upload, Rule
 
 import boto3
-from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, Query, Body, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, Query, Body, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy import text as sqltext
+from sqlalchemy.ext.asyncio import AsyncSession
 from openai import OpenAI
+
+from .database import async_session
 
 from models import Upload  # must include retrieved_rules, human_label, human_notes, reviewed_at
 from dotenv import load_dotenv
@@ -57,15 +60,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.get("/api/rules")
-def list_all_rules():
-    rules_dir = os.path.join(os.path.dirname(__file__), "rules")
-    filenames = [
-        os.path.splitext(f)[0].replace("_", " ").title()
-        for f in os.listdir(rules_dir)
-        if f.endswith(".txt")
-    ]
-    return filenames
+# Dependency to get the database session
+async def get_db():
+    async with async_session() as session:
+        yield session
+
+@app.get("/api/rules/list")
+async def list_rules(db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(Rule))
+    rules = result.scalars().all()
+    return [{"label": r.label, "value": r.value} for r in rules]
 
 # ------------------------------------------------------------------------------
 # Schemas
