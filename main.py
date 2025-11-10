@@ -20,7 +20,7 @@ from sqlalchemy import text as sqltext
 from sqlalchemy.ext.asyncio import AsyncSession
 from openai import OpenAI
 
-from .database import async_session
+from database import async_session
 
 from models import Upload  # must include retrieved_rules, human_label, human_notes, reviewed_at
 from dotenv import load_dotenv
