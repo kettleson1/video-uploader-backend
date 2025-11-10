@@ -55,7 +55,7 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://3.135.12.183:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -70,7 +70,7 @@ async def get_db():
 async def list_rules(db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(Rule))
     rules = result.scalars().all()
-    return [{"label": r.label, "value": r.value} for r in rules]
+    return [{"label": r.title, "value": r.id} for r in rules]
 
 # ------------------------------------------------------------------------------
 # Schemas
