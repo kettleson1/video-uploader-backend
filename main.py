@@ -262,52 +262,53 @@ def _predict_with_rules(summary: str, retrieved: list[dict]) -> tuple[str, float
         pass
     return label, conf, expl
 # ------------------------------------------------------------------------------
-# Background worker
+# Background worker (async version)
 # ------------------------------------------------------------------------------
 async def _process_upload_bg(upload_id: int, s3_url: str, foul_hint: str):
-    db: Session = SessionLocal()
-    try:
-        # 1) Download bytes
-        key = _s3_key_from_url(s3_url)
-        obj = s3_client.get_object(Bucket=BUCKET_NAME, Key=key)
-        video_bytes: bytes = obj["Body"].read()
+    async with async_session() as db:
+        try:
+            # 1) Download bytes
+            key = _s3_key_from_url(s3_url)
+            obj = s3_client.get_object(Bucket=BUCKET_NAME, Key=key)
+            video_bytes: bytes = obj["Body"].read()
 
-        # 2) Frames -> summary
-        frames = _extract_frames(video_bytes, fps=1, max_frames=6)
-        summary = await _summarize_frames_async(frames)
+            # 2) Frames -> summary
+            frames = _extract_frames(video_bytes, fps=1, max_frames=6)
+            summary = await _summarize_frames_async(frames)
 
-        # 3) Retrieve rules
-        retrieved = _retrieve_rules(summary, top_k=3)
+            # 3) Retrieve rules
+            retrieved = _retrieve_rules(summary, top_k=3)
 
-        # 4) Decide with LLM
-        label, confidence, explanation_text = _predict_with_rules(summary, retrieved)
+            # 4) Decide with LLM
+            label, confidence, explanation_text = _predict_with_rules(summary, retrieved)
 
-        # 4b) Confidence thresholding
-        final_label = label
-        final_conf = float(confidence)
-        if final_conf < CONFIDENCE_THRESHOLD:
-            final_label = "Uncertain"
+            # 4b) Confidence thresholding
+            final_label = label
+            final_conf = float(confidence)
+            if final_conf < CONFIDENCE_THRESHOLD:
+                final_label = "Uncertain"
 
-        # 5) Update DB (also SAVE retrieved_rules)
-        row = db.query(Upload).get(upload_id)
-        if row:
-            row.status = "done"
-            row.prediction_label = final_label
-            row.confidence = final_conf
-            row.explanation = explanation_text
-            row.processed_at = _now_utc()
-            row.error_message = None
-            row.retrieved_rules = retrieved
-            db.commit()
-    except Exception as e:
-        row = db.query(Upload).get(upload_id)
-        if row:
-            row.status = "error"
-            row.error_message = _safe_err_text(e)
-            row.processed_at = _now_utc()
-            db.commit()
-    finally:
-        db.close()
+            # 5) Update DB (also SAVE retrieved_rules)
+            result = await db.execute(select(Upload).where(Upload.id == upload_id))
+            row = result.scalar_one_or_none()
+
+            if row:
+                row.status = "done"
+                row.prediction_label = final_label
+                row.confidence = final_conf
+                row.explanation = explanation_text
+                row.processed_at = _now_utc()
+                row.error_message = None
+                row.retrieved_rules = retrieved
+                await db.commit()
+        except Exception as e:
+            result = await db.execute(select(Upload).where(Upload.id == upload_id))
+            row = result.scalar_one_or_none()
+            if row:
+                row.status = "error"
+                row.error_message = _safe_err_text(e)
+                row.processed_at = _now_utc()
+                await db.commit()
 
 # ------------------------------------------------------------------------------
 # Routes
@@ -323,7 +324,6 @@ class ReviewIn(BaseModel):
 
 @app.post("/upload", response_model=UploadResponse)
 async def upload_video(
-    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     foul_type: str = Form(...),
     notes: str = Form(""),
@@ -421,23 +421,25 @@ def health_check():
     return {"status": "ok"}
 
 @app.post("/api/retry/{upload_id}")
-def retry_upload(upload_id: int):
-    db: Session = SessionLocal()
-    try:
-        row = db.query(Upload).get(upload_id)
-        if not row:
-            return {"ok": False, "error": "Not found"}
+async def retry_upload(upload_id: int, db: AsyncSession = Depends(get_db)):
+    """Mark upload queued and re-run async background worker."""
+    # Fetch the row using async session
+    result = await db.execute(select(Upload).where(Upload.id == upload_id))
+    row = result.scalar_one_or_none()
 
-        row.status = "queued"
-        row.error_message = None
-        row.processed_at = None
-        db.commit()
+    if not row:
+        return {"ok": False, "error": "Not found"}
 
-        # Run synchronously here; in prod use a queue/worker
-        _process_upload_bg(upload_id=row.id, s3_url=row.s3_url, foul_hint=row.foul_type)
-        return {"ok": True, "id": upload_id}
-    finally:
-        db.close()
+    # Update status and clear error/processed flags
+    row.status = "queued"
+    row.error_message = None
+    row.processed_at = None
+    await db.commit()
+
+    # Launch async background worker (non-blocking)
+    asyncio.create_task(_process_upload_bg(row.id, row.s3_url, row.foul_type))
+
+    return {"ok": True, "id": upload_id}
 
 @app.patch("/api/plays/{upload_id}/review")
 def set_human_review(upload_id: int, payload: ReviewPayload):
