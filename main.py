@@ -19,6 +19,7 @@ from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy import text as sqltext
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
+import asyncio
 from openai import OpenAI
 
 from database import async_session
@@ -147,24 +148,22 @@ def _extract_frames(video_bytes: bytes, fps: int = 1, max_frames: int = 6) -> Li
                 frames_b64.append(b64)
     return frames_b64
 
-def _summarize_frames(frames_b64: List[str]) -> str:
+async def _summarize_frames_async(frames_b64: List[str]) -> str:
     """
-    Summarize the play from a handful of frames.
+    Async: Summarize the play from a handful of frames.
     """
     if not frames_b64:
         return "No visual context available."
 
-    # Build a minimal text prompt (we’re not using image inputs here)
     prompt = (
         "You are an assistant that writes a concise description of a football play "
         "from a few snapshots. Mention formation/positions, motion, snap, contact, "
         "and any obvious infractions if clearly visible. Keep it under ~70 words."
     )
-    # We only send text; frames are extracted for potential future use with vision models.
+
     msg = f"{prompt}\n\nFrames extracted: {len(frames_b64)} representative images (not attached)."
 
-    # Use a lightweight model for cost/speed; adjust if you prefer.
-    chat = client.chat.completions.create(
+    chat = await client.chat.completions.create(
         model=os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini"),
         messages=[{"role": "user", "content": msg}],
         temperature=0.2,
@@ -265,7 +264,7 @@ def _predict_with_rules(summary: str, retrieved: list[dict]) -> tuple[str, float
 # ------------------------------------------------------------------------------
 # Background worker
 # ------------------------------------------------------------------------------
-def _process_upload_bg(upload_id: int, s3_url: str, foul_hint: str):
+async def _process_upload_bg(upload_id: int, s3_url: str, foul_hint: str):
     db: Session = SessionLocal()
     try:
         # 1) Download bytes
@@ -275,7 +274,7 @@ def _process_upload_bg(upload_id: int, s3_url: str, foul_hint: str):
 
         # 2) Frames -> summary
         frames = _extract_frames(video_bytes, fps=1, max_frames=6)
-        summary = _summarize_frames(frames)
+        summary = await _summarize_frames_async(frames)
 
         # 3) Retrieve rules
         retrieved = _retrieve_rules(summary, top_k=3)
@@ -298,13 +297,13 @@ def _process_upload_bg(upload_id: int, s3_url: str, foul_hint: str):
             row.explanation = explanation_text
             row.processed_at = _now_utc()
             row.error_message = None
-            row.retrieved_rules = retrieved  # <--- store JSON for rules drawer
+            row.retrieved_rules = retrieved
             db.commit()
     except Exception as e:
         row = db.query(Upload).get(upload_id)
         if row:
             row.status = "error"
-            row.error_message = _safe_err_text(e)  # stringify error
+            row.error_message = _safe_err_text(e)
             row.processed_at = _now_utc()
             db.commit()
     finally:
@@ -366,7 +365,7 @@ async def upload_video(
             await db.refresh(rec)
             print("✅ DB write complete with ID:", rec.id)
 
-            background_tasks.add_task(_process_upload_bg, rec.id, s3_url, foul_type)
+            asyncio.create_task(_process_upload_bg(rec.id, s3_url, foul_type))
             response = UploadResponse(id=rec.id, s3_url=s3_url)
             print("✅ UploadResponse ready:", response.dict())
             return response
