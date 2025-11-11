@@ -179,9 +179,14 @@ def _embed_text(text_in: str) -> List[float]:
     vec = resp.data[0].embedding
     return [float(x) for x in vec]
 
-def _retrieve_rules(summary: str, top_k: int = 3) -> List[dict]:
+
+
+# ------------------------------------------------------------------------------
+# Async rule retrieval using pgvector
+# ------------------------------------------------------------------------------
+async def _retrieve_rules_async(summary: str, top_k: int = 3) -> List[dict]:
     """
-    Retrieve closest rule chunks via pgvector (cosine).
+    Async: Retrieve closest rule chunks via pgvector (cosine).
     Column type: vector(3072)
     """
     emb = _embed_text(summary)  # 3072-D
@@ -199,8 +204,8 @@ def _retrieve_rules(summary: str, top_k: int = 3) -> List[dict]:
         LIMIT :k
     """)
 
-    with engine.begin() as conn:
-        rows = conn.execute(sql, {"qvec": qvec_literal, "k": top_k}).mappings().all()
+    async with async_session() as session:
+        rows = (await session.execute(sql, {"qvec": qvec_literal, "k": top_k})).mappings().all()
 
     # Make sure everything is JSON-serializable (no Decimals)
     out = []
@@ -276,8 +281,8 @@ async def _process_upload_bg(upload_id: int, s3_url: str, foul_hint: str):
             frames = _extract_frames(video_bytes, fps=1, max_frames=6)
             summary = await _summarize_frames_async(frames)
 
-            # 3) Retrieve rules
-            retrieved = _retrieve_rules(summary, top_k=3)
+            # 3) Retrieve rules (async)
+            retrieved = await _retrieve_rules_async(summary, top_k=3)
 
             # 4) Decide with LLM
             label, confidence, explanation_text = _predict_with_rules(summary, retrieved)
