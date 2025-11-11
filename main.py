@@ -18,6 +18,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy import text as sqltext
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.future import select
 from openai import OpenAI
 
 from database import async_session
@@ -55,12 +56,17 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://3.135.12.183:3000"],
+    allow_origins=[
+        "http://3.135.12.183:3000",
+        "http://3.135.12.183",
+        "http://localhost:3000",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
+# or temporarily for quick testing:
+# allow_origins=["*"]
 # Dependency to get the database session
 async def get_db():
     async with async_session() as session:
@@ -322,6 +328,7 @@ async def upload_video(
     file: UploadFile = File(...),
     foul_type: str = Form(...),
     notes: str = Form(""),
+    db: AsyncSession = Depends(get_db),
 ):
     print("📥 Upload request received")
 
@@ -345,8 +352,7 @@ async def upload_video(
         s3_url = f"https://{BUCKET_NAME}.s3.{AWS_REGION}.amazonaws.com/{key}"
         print("🌐 S3 URL:", s3_url)
 
-        # DB Write
-        db: Session = SessionLocal()
+        # DB Write (async)
         try:
             rec = Upload(
                 s3_url=s3_url,
@@ -356,8 +362,8 @@ async def upload_video(
                 status="queued",
             )
             db.add(rec)
-            db.commit()
-            db.refresh(rec)
+            await db.commit()
+            await db.refresh(rec)
             print("✅ DB write complete with ID:", rec.id)
 
             background_tasks.add_task(_process_upload_bg, rec.id, s3_url, foul_type)
@@ -367,13 +373,11 @@ async def upload_video(
         except Exception as db_error:
             print("❌ DB write failed:", db_error)
             raise HTTPException(status_code=500, detail="DB write failed")
-        finally:
-            db.close()
 
     except Exception as e:
         print("❌ Unexpected error in /upload:", e)
         raise HTTPException(status_code=500, detail="Unexpected server error")
-        
+    
 @app.get("/api/plays")
 def list_recent_plays(limit: int = Query(25, ge=1, le=200)) -> List[dict]:
     """
