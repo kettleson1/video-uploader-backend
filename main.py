@@ -57,17 +57,11 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://3.135.12.183:3000",
-        "http://3.135.12.183",
-        "http://localhost:3000",
-    ],
+    allow_origins=["*"],  # temporarily allow all origins during development
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-# or temporarily for quick testing:
-# allow_origins=["*"]
 # Dependency to get the database session
 async def get_db():
     async with async_session() as session:
@@ -542,8 +536,4 @@ def submit_review(upload_id: int, payload: ReviewIn = Body(...)):
 # ------------------------------------------------------------------------------
 # (Optional) list rules for populating UI dropdowns
 # ------------------------------------------------------------------------------
-@app.get("/api/rules/list")
-def get_rules():
-    db = SessionLocal()
-    rules = db.query(Rule).all()
-    return [rule.as_dict() for rule in rules]
+# Removed duplicate /api/rules/list endpoint
