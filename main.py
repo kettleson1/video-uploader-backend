@@ -266,20 +266,29 @@ def _predict_with_rules(summary: str, retrieved: list[dict]) -> tuple[str, float
 async def _process_upload_bg(upload_id: int, s3_url: str, foul_hint: str):
     async with async_session() as db:
         try:
+            print(f"📥 Starting processing for upload_id={upload_id}")
+             
             # 1) Download bytes
             key = _s3_key_from_url(s3_url)
             obj = s3_client.get_object(Bucket=BUCKET_NAME, Key=key)
             video_bytes: bytes = obj["Body"].read()
 
+            print("✅ Video downloaded from S3")
+
             # 2) Frames -> summary
             frames = _extract_frames(video_bytes, fps=1, max_frames=6)
+            print(f"📸 Extracted {len(frames)} frames")
+
             summary = await _summarize_frames_async(frames)
+            print(f"✍️ Summary: {summary}")
 
             # 3) Retrieve rules (async)
             retrieved = await _retrieve_rules_async(summary, top_k=3)
-
+            print(f"📚 Retrieved {len(retrieved)} rules")
+            
             # 4) Decide with LLM
             label, confidence, explanation_text = _predict_with_rules(summary, retrieved)
+            print(f"📊 Predicted: {label} (confidence={confidence})")
 
             # 4b) Confidence thresholding
             final_label = label
@@ -301,6 +310,7 @@ async def _process_upload_bg(upload_id: int, s3_url: str, foul_hint: str):
                 row.retrieved_rules = retrieved
                 await db.commit()
         except Exception as e:
+            print(f"❌ Error in _process_upload_bg: {str(e)}")
             result = await db.execute(select(Upload).where(Upload.id == upload_id))
             row = result.scalar_one_or_none()
             if row:
