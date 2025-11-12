@@ -89,7 +89,7 @@ class ReviewPayload(BaseModel):
 # Helpers
 # ------------------------------------------------------------------------------
 def _now_utc():
-    return datetime.now(timezone.utc)
+    return datetime.now(timezone.utc).replace(tzinfo=None) 
 
 def _safe_err_text(e: Exception) -> str:
     try:
