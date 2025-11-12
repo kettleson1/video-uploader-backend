@@ -377,18 +377,15 @@ async def upload_video(
         raise HTTPException(status_code=500, detail="Unexpected server error")
     
 @app.get("/api/plays")
-def list_recent_plays(limit: int = Query(25, ge=1, le=200)) -> List[dict]:
-    """
-    Include retrieved_rules so the UI can open a drawer without another fetch.
-    """
-    db: Session = SessionLocal()
+async def list_recent_plays(limit: int = Query(25, ge=1, le=200), db: AsyncSession = Depends(get_db)) -> List[dict]:
     try:
-        rows = (
-            db.query(Upload)
-              .order_by(Upload.id.desc())
-              .limit(limit)
-              .all()
+        result = await db.execute(
+            select(Upload)
+            .order_by(Upload.id.desc())
+            .limit(limit)
         )
+        rows = result.scalars().all()
+
         out = []
         for r in rows:
             key = _s3_key_from_url(r.s3_url)
@@ -404,7 +401,7 @@ def list_recent_plays(limit: int = Query(25, ge=1, le=200)) -> List[dict]:
                 "processed_at": r.processed_at.isoformat() if r.processed_at else None,
                 "error_message": r.error_message,
                 "explanation": getattr(r, "explanation", None),
-                "retrieved_rules": getattr(r, "retrieved_rules", None),  # <--- included
+                "retrieved_rules": getattr(r, "retrieved_rules", None),
                 "human_label": getattr(r, "human_label", None),
                 "human_notes": getattr(r, "human_notes", None),
                 "reviewed_at": r.reviewed_at.isoformat() if getattr(r, "reviewed_at", None) else None,
@@ -412,6 +409,8 @@ def list_recent_plays(limit: int = Query(25, ge=1, le=200)) -> List[dict]:
                 "presigned_url": presigned,
             })
         return out
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
     finally:
         db.close()
 
