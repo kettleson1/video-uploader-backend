@@ -213,7 +213,7 @@ async def _retrieve_rules_async(summary: str, top_k: int = 3) -> List[dict]:
         })
     return out
 
-def _predict_with_rules(summary: str, retrieved: list[dict]) -> tuple[str, float, str]:
+async def _predict_with_rules(summary: str, retrieved: list[dict]) -> tuple[str, float, str]:
     """
     Use LLM to choose a label and produce confidence + explanation.
     Returned: (label, confidence[0..1], explanation)
@@ -240,7 +240,7 @@ def _predict_with_rules(summary: str, retrieved: list[dict]) -> tuple[str, float
         "Respond as JSON with keys: label, confidence, explanation."
     )
 
-    chat = client.chat.completions.create(
+    chat = await client.chat.completions.create(
         model=os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini"),
         messages=[
             {"role": "system", "content": sys_prompt},
@@ -287,7 +287,7 @@ async def _process_upload_bg(upload_id: int, s3_url: str, foul_hint: str):
             print(f"📚 Retrieved {len(retrieved)} rules")
             
             # 4) Decide with LLM
-            label, confidence, explanation_text = _predict_with_rules(summary, retrieved)
+            label, confidence, explanation_text = await _predict_with_rules(summary, retrieved)
             print(f"📊 Predicted: {label} (confidence={confidence})")
 
             # 4b) Confidence thresholding
