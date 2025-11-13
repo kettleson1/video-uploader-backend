@@ -20,7 +20,7 @@ from sqlalchemy import text as sqltext
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 import asyncio
-from openai import OpenAI
+from openai import AsyncOpenAI
 
 from database import async_session
 
@@ -48,7 +48,7 @@ s3_client = boto3.client("s3", region_name=AWS_REGION)
 engine = create_engine(
 DATABASE_URL)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
-client = OpenAI(api_key=OPENAI_API_KEY)
+client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
 # ------------------------------------------------------------------------------
 # FastAPI
@@ -89,7 +89,7 @@ class ReviewPayload(BaseModel):
 # Helpers
 # ------------------------------------------------------------------------------
 def _now_utc():
-    return datetime.now(timezone.utc).astimezone().replace(tzinfo=None)
+    return datetime.now(timezone.utc)
 
 def _safe_err_text(e: Exception) -> str:
     try:
@@ -421,8 +421,6 @@ async def list_recent_plays(limit: int = Query(25, ge=1, le=200), db: AsyncSessi
         return out
     except Exception as e:
         return {"ok": False, "error": str(e)}
-    finally:
-        db.close()
 
 @app.get("/health")
 def health_check():
