@@ -165,11 +165,11 @@ async def _summarize_frames_async(frames_b64: List[str]) -> str:
     )
     return (chat.choices[0].message.content or "").strip()
 
-def _embed_text(text_in: str) -> List[float]:
+async def _embed_text(text_in: str) -> List[float]:
     """
-    Create a 3072-D embedding (text-embedding-3-large).
+    Async: Create a 3072-D embedding (text-embedding-3-large).
     """
-    resp = client.embeddings.create(model=OPENAI_EMBED_MODEL, input=text_in)
+    resp = await client.embeddings.create(model=OPENAI_EMBED_MODEL, input=text_in)
     vec = resp.data[0].embedding
     return [float(x) for x in vec]
 
@@ -183,7 +183,7 @@ async def _retrieve_rules_async(summary: str, top_k: int = 3) -> List[dict]:
     Async: Retrieve closest rule chunks via pgvector (cosine).
     Column type: vector(3072)
     """
-    emb = _embed_text(summary)  # 3072-D
+    emb = await _embed_text(summary)  # 3072-D
     qvec_literal = "[" + ",".join(f"{x:.6f}" for x in emb) + "]"
 
     sql = sqltext("""
