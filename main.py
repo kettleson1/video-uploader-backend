@@ -58,7 +58,8 @@ app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://www.davesystemsinc.com",   # ✅ production frontend
+        "https://www.davesystemsinc.com", # ✅ production frontend
+        "https://davesystemsinc.com",
         "http://localhost:3000"             # ✅ local testing
     ],
     allow_credentials=True,
