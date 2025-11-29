@@ -394,7 +394,9 @@ async def upload_video(
     except Exception as e:
         print("❌ Unexpected error in /upload:", e)
         raise HTTPException(status_code=500, detail="Unexpected server error")
-    
+
+app.add_api_route("/api/upload", upload_video, methods=["POST"])
+
 @app.get("/api/plays")
 async def list_recent_plays(limit: int = Query(25, ge=1, le=200), db: AsyncSession = Depends(get_db)) -> List[dict]:
     try:
