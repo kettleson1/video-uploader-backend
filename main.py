@@ -53,7 +53,12 @@ client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 # ------------------------------------------------------------------------------
 # FastAPI
 # ------------------------------------------------------------------------------
-app = FastAPI()
+app = FastAPI(
+    title="Video Uploader API",
+    docs_url="/api/docs",
+    redoc_url="/api/redoc",
+    openapi_url="/api/openapi.json",
+)
 
 app.add_middleware(
     CORSMiddleware,
