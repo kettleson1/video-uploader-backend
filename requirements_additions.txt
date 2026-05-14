@@ -1,0 +1,28 @@
+# requirements_additions.txt
+# ===========================
+# Add these packages to your existing requirements.txt
+# Install with: pip install -r requirements_additions.txt
+
+# Video frame extraction
+opencv-python-headless==4.10.0.84   # headless = no GUI deps, perfect for server use
+
+# AWS S3 (you likely already have this — check your requirements.txt first)
+boto3>=1.34.0
+
+# OpenAI SDK (you likely already have this — confirm version supports vision)
+# Must be openai>=1.0.0 for the new client API used in video_processor.py
+openai>=1.30.0
+
+# numpy is pulled in by opencv, but pinning for safety
+numpy>=1.26.0
+
+# ===========================
+# Optional: install ffmpeg system package for broader codec support
+# On Ubuntu/Debian (your likely server OS):
+#   sudo apt-get install -y ffmpeg
+#
+# OpenCV will fall back to its built-in codec support without it,
+# but ffmpeg handles .mov, .avi, .mkv and H.265 clips better.
+# Add this to your Dockerfile or EC2 user-data script:
+#   RUN apt-get update && apt-get install -y ffmpeg libgl1
+# ===========================
