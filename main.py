@@ -29,12 +29,22 @@ from models import Upload  # must include retrieved_rules, human_label, human_no
 from dotenv import load_dotenv
 load_dotenv()
 
-from fastapi.middleware.cors import CORSMiddleware
-
-
 # ------------------------------------------------------------------------------
 # Environment / Clients
 # ------------------------------------------------------------------------------
+DEFAULT_CORS_ALLOWED_ORIGINS = [
+    "https://www.davesystemsinc.com",
+    "https://davesystemsinc.com",
+    "http://localhost:3000",
+]
+
+
+def _parse_cors_origins(value: Optional[str]) -> List[str]:
+    if not value:
+        return DEFAULT_CORS_ALLOWED_ORIGINS
+    return [origin.strip() for origin in value.split(",") if origin.strip()]
+
+
 AWS_REGION = os.getenv("AWS_REGION", "us-east-2")
 BUCKET_NAME = os.getenv("AWS_S3_BUCKET")
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -42,6 +52,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_EMBED_MODEL = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-large")  # 3072-D
 CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.60"))
 DAVE_API_KEY = os.getenv("DAVE_API_KEY")
+CORS_ALLOWED_ORIGINS = _parse_cors_origins(os.getenv("CORS_ALLOWED_ORIGINS"))
 
 if not (BUCKET_NAME and DATABASE_URL and OPENAI_API_KEY):
     raise RuntimeError("Missing required env vars: AWS_S3_BUCKET, DATABASE_URL, OPENAI_API_KEY")
@@ -64,11 +75,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://www.davesystemsinc.com", # ✅ production frontend
-        "https://davesystemsinc.com",
-        "http://localhost:3000"             # ✅ local testing
-    ],
+    allow_origins=CORS_ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -104,6 +111,11 @@ class ReviewPayload(BaseModel):
     human_label: Optional[str] = None
     human_notes: Optional[str] = None
     reviewed: bool = False
+
+class OfficialFeedbackIn(BaseModel):
+    official_agrees: bool
+    human_label: Optional[str] = None
+    human_notes: Optional[str] = None
 
 # ------------------------------------------------------------------------------
 # Helpers
@@ -518,6 +530,13 @@ async def list_recent_plays(
         for r in rows:
             key = _s3_key_from_url(r.s3_url)
             presigned = _presign(key, 3600)
+            official_agrees = None
+            if (
+                getattr(r, "reviewed_at", None)
+                and getattr(r, "human_label", None)
+                and r.prediction_label
+            ):
+                official_agrees = r.human_label == r.prediction_label
             out.append({
                 "id": r.id,
                 "foul_type": r.foul_type,
@@ -533,6 +552,7 @@ async def list_recent_plays(
                 "human_label": getattr(r, "human_label", None),
                 "human_notes": getattr(r, "human_notes", None),
                 "reviewed_at": r.reviewed_at.isoformat() if getattr(r, "reviewed_at", None) else None,
+                "official_agrees": official_agrees,
                 "s3_url": r.s3_url,
                 "presigned_url": presigned,
             })
@@ -596,6 +616,52 @@ def set_human_review(
         db.close()
 
 
+@app.post("/api/plays/{upload_id}/feedback")
+def submit_official_feedback(
+    upload_id: int,
+    payload: OfficialFeedbackIn,
+    _auth: None = Depends(require_api_key),
+):
+    """
+    Save a low-friction official feedback signal without replacing the AI prediction.
+    Agreement is stored as human_label == prediction_label; disagreement stores the
+    official correction in human_label.
+    """
+    db: Session = SessionLocal()
+    try:
+        row = db.query(Upload).get(upload_id)
+        if not row:
+            return {"ok": False, "error": "Not found"}
+
+        notes = payload.human_notes.strip() if payload.human_notes else None
+
+        if payload.official_agrees:
+            if not row.prediction_label:
+                return {"ok": False, "error": "No prediction available to agree with"}
+            row.human_label = row.prediction_label
+        else:
+            label = payload.human_label.strip() if payload.human_label else ""
+            if not label:
+                return {"ok": False, "error": "Correct label is required when disagreeing"}
+            row.human_label = label
+
+        row.human_notes = notes
+        row.reviewed_at = _now_utc()
+        db.commit()
+
+        return {
+            "ok": True,
+            "id": upload_id,
+            "official_agrees": payload.official_agrees,
+            "human_label": row.human_label,
+            "reviewed_at": row.reviewed_at.isoformat() if row.reviewed_at else None,
+        }
+    except Exception as e:
+        return {"ok": False, "error": _safe_err_text(e)}
+    finally:
+        db.close()
+
+
 # ------------------------------------------------------------------------------
 # Rules: quick search (already handy for sanity checks)
 # ------------------------------------------------------------------------------
@@ -636,8 +702,6 @@ async def search_rules(
 # ------------------------------------------------------------------------------
 # 1.e Human review route
 # ------------------------------------------------------------------------------
-from typing import Optional  # Make sure this is imported at the top
-
 class ReviewIn(BaseModel):
     human_label: Optional[str] = None
     human_notes: Optional[str] = None

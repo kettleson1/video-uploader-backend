@@ -59,7 +59,10 @@ OPENAI_CHAT_MODEL=gpt-4o-mini
 OPENAI_EMBED_MODEL=text-embedding-3-large
 OPENAI_IMAGE_DETAIL=high
 CONFIDENCE_THRESHOLD=0.60
+CORS_ALLOWED_ORIGINS=https://www.davesystemsinc.com,https://davesystemsinc.com,http://localhost:3000
 ```
+
+`CORS_ALLOWED_ORIGINS` is a comma-separated list. If it is omitted, the backend allows the DAVE production domains and `http://localhost:3000` for local development.
 
 The database must have pgvector available. `ingest_rules.py` creates the `rules` table and vector extension if permissions allow it.
 
@@ -135,6 +138,7 @@ http://localhost:8000/api/docs
 | `/api/retry/{upload_id}` | POST | Re-run background processing for an upload |
 | `/api/rules/list` | GET | Return rules for the frontend dropdown |
 | `/api/rules/search` | GET | Search rule snippets with pgvector |
+| `/api/plays/{upload_id}/feedback` | POST | Save official agree/disagree feedback |
 | `/api/review/{upload_id}` | POST | Save human review and optional prediction override |
 | `/api/plays/{upload_id}/review` | PATCH | Save or clear human review data |
 
