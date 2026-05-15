@@ -69,7 +69,7 @@ def _vec_literal(vec: List[float]) -> str:
 
 def upsert_rule_chunk(title: str, section: str, body: str) -> None:
     """Insert or update a single rule chunk with its embedding."""
-    emb = _embed_text(body)
+    emb = _embed_text(f"{title}\n{body}")
     # (Optional) sanity log once per run
     # print(f"Embedded with {OPENAI_EMBED_MODEL}, dim={len(emb)} for {title}:{section}")
 

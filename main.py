@@ -5,12 +5,13 @@ import json
 import base64
 import tempfile
 import subprocess
+import secrets
 from datetime import datetime, timezone
 from typing import List, Optional
 from models import Upload, Rule
 
 import boto3
-from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, Query, Body, HTTPException, Depends
+from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, Query, Body, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import create_engine
@@ -40,6 +41,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_EMBED_MODEL = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-large")  # 3072-D
 CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.60"))
+DAVE_API_KEY = os.getenv("DAVE_API_KEY")
 
 if not (BUCKET_NAME and DATABASE_URL and OPENAI_API_KEY):
     raise RuntimeError("Missing required env vars: AWS_S3_BUCKET, DATABASE_URL, OPENAI_API_KEY")
@@ -76,11 +78,20 @@ async def get_db():
     async with async_session() as session:
         yield session
 
+def require_api_key(x_dave_api_key: Optional[str] = Header(None, alias="X-DAVE-API-Key")):
+    if not DAVE_API_KEY:
+        raise HTTPException(status_code=503, detail="API authentication is not configured")
+    if not x_dave_api_key or not secrets.compare_digest(x_dave_api_key, DAVE_API_KEY):
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
 @app.get("/api/rules/list")
-async def list_rules(db: AsyncSession = Depends(get_db)):
+async def list_rules(
+    db: AsyncSession = Depends(get_db),
+    _auth: None = Depends(require_api_key),
+):
     result = await db.execute(select(Rule))
     rules = result.scalars().all()
-    return [{"label": r.title, "value": r.id} for r in rules]
+    return [{"label": r.title, "value": r.title} for r in rules]
 
 # ------------------------------------------------------------------------------
 # Schemas
@@ -109,6 +120,38 @@ def _safe_err_text(e: Exception) -> str:
 def _s3_key_from_url(url: str) -> str:
     # https://bucket.s3.region.amazonaws.com/<key>
     return url.split(".amazonaws.com/")[-1]
+
+def _coerce_confidence(value, default: float = 0.0) -> float:
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return max(0.0, min(1.0, float(value)))
+
+    text = str(value).strip().lower()
+    if not text:
+        return default
+    word_scores = {
+        "very high": 0.95,
+        "high": 0.85,
+        "medium": 0.60,
+        "moderate": 0.60,
+        "low": 0.35,
+        "very low": 0.15,
+    }
+    if text in word_scores:
+        return word_scores[text]
+    if text.endswith("%"):
+        try:
+            return max(0.0, min(1.0, float(text[:-1]) / 100.0))
+        except ValueError:
+            return default
+    try:
+        num = float(text)
+        if num > 1:
+            num = num / 100.0
+        return max(0.0, min(1.0, num))
+    except ValueError:
+        return default
 
 def _presign(key: str, expires: int = 3600) -> Optional[str]:
     try:
@@ -151,26 +194,56 @@ def _extract_frames(video_bytes: bytes, fps: int = 1, max_frames: int = 6) -> Li
                 frames_b64.append(b64)
     return frames_b64
 
-async def _summarize_frames_async(frames_b64: List[str]) -> str:
+async def _summarize_frames_async(
+    frames_b64: List[str],
+    foul_hint: str = "",
+    notes: str = "",
+) -> str:
     """
-    Async: Summarize the play from a handful of frames.
+    Async: Summarize the play from a handful of actual video frames.
     """
     if not frames_b64:
         return "No visual context available."
 
-    prompt = (
-        "You are an assistant that writes a concise description of a football play "
-        "from a few snapshots. Mention formation/positions, motion, snap, contact, "
-        "and any obvious infractions if clearly visible. Keep it under ~70 words."
+    system_prompt = (
+        "You are an expert NFHS high school football officiating video analyst. "
+        "Describe only what is visible in the frames. Be precise about timing, "
+        "player roles, ball location, contact type, target area, and whether the "
+        "action is clear or ambiguous. Do not invent unseen action."
     )
 
-    msg = f"{prompt}\n\nFrames extracted: {len(frames_b64)} representative images (not attached)."
+    user_text = (
+        f"Analyze these {len(frames_b64)} chronological frames from one football play.\n"
+        f"Selected foul type from the form: {foul_hint or 'not provided'}\n"
+        f"Official/user notes: {notes or 'none'}\n\n"
+        "Return a compact evidence summary for rule lookup with these fields:\n"
+        "- play phase\n"
+        "- key visible action\n"
+        "- timing relative to snap/pass/kick/ball arrival if visible\n"
+        "- players involved\n"
+        "- possible foul indicators\n"
+        "- uncertainty or missing camera evidence\n"
+        "Keep it under 180 words."
+    )
+
+    content: list[dict] = [{"type": "text", "text": user_text}]
+    for frame in frames_b64:
+        content.append({
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:image/jpeg;base64,{frame}",
+                "detail": os.getenv("OPENAI_IMAGE_DETAIL", "high"),
+            },
+        })
 
     chat = await client.chat.completions.create(
         model=os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini"),
-        messages=[{"role": "user", "content": msg}],
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": content},
+        ],
         temperature=0.2,
-        max_tokens=140,
+        max_tokens=320,
     )
     return (chat.choices[0].message.content or "").strip()
 
@@ -222,7 +295,12 @@ async def _retrieve_rules_async(summary: str, top_k: int = 3) -> List[dict]:
         })
     return out
 
-async def _predict_with_rules(summary: str, retrieved: list[dict]) -> tuple[str, float, str]:
+async def _predict_with_rules(
+    summary: str,
+    retrieved: list[dict],
+    foul_hint: str = "",
+    notes: str = "",
+) -> tuple[str, float, str]:
     """
     Use LLM to choose a label and produce confidence + explanation.
     Returned: (label, confidence[0..1], explanation)
@@ -238,15 +316,18 @@ async def _predict_with_rules(summary: str, retrieved: list[dict]) -> tuple[str,
     rules_snips = "\n\n".join(parts).strip() or "No matching rule snippets."
 
     sys_prompt = (
-        "You are a high school football rule assistant. "
-        "Given a short play summary and a few rule snippets, choose the most likely foul label "
-        "from the snippets (or 'None' if no foul). Provide a numeric confidence in [0,1] "
-        "and a 1-2 sentence explanation grounded in the snippets."
+        "You are an NFHS high school football rules assistant. "
+        "Choose the most likely foul label only when the video evidence and rule snippets support it. "
+        "If the evidence is unclear or no provided rule fits, use 'None' or 'Uncertain'. "
+        "Ground the explanation in visible evidence and the cited snippets."
     )
     user_prompt = (
         f"PLAY SUMMARY:\n{summary}\n\n"
+        f"SELECTED FOUL TYPE/HINT:\n{foul_hint or 'not provided'}\n\n"
+        f"OFFICIAL/USER NOTES:\n{notes or 'none'}\n\n"
         f"CANDIDATE RULE SNIPPETS:\n{rules_snips}\n\n"
-        "Respond as JSON with keys: label, confidence, explanation."
+        "Respond as JSON with keys: label, confidence, explanation. "
+        "The explanation must include the candidate rule title or section used."
     )
 
     chat = await client.chat.completions.create(
@@ -257,22 +338,35 @@ async def _predict_with_rules(summary: str, retrieved: list[dict]) -> tuple[str,
         ],
         temperature=0.1,
         max_tokens=220,
+        response_format={"type": "json_object"},
     )
     txt = (chat.choices[0].message.content or "").strip()
 
-    label, conf, expl = "None", 0.8, "No clear foul per snippets."
+    label, conf, expl = "None", 0.0, ""
     try:
+        if txt.startswith("```"):
+            txt = "\n".join(txt.splitlines()[1:])
+        if txt.endswith("```"):
+            txt = "\n".join(txt.splitlines()[:-1])
         j = json.loads(txt)
         label = str(j.get("label", "None"))
-        conf = float(j.get("confidence", 0.8))
-        expl = str(j.get("explanation", "")) or expl
+        conf = _coerce_confidence(j.get("confidence"), 0.0)
+        expl = str(j.get("explanation", "")).strip()
     except Exception:
-        pass
+        expl = f"Model returned non-JSON output: {txt[:300]}"
+
+    if not expl:
+        top_rule = retrieved[0] if retrieved else {}
+        rule_title = top_rule.get("title") or "the retrieved rule snippets"
+        expl = (
+            f"Prediction is based on the visible play summary, the foul hint "
+            f"'{foul_hint or 'not provided'}', and the top retrieved rule {rule_title}."
+        )
     return label, conf, expl
 # ------------------------------------------------------------------------------
 # Background worker (async version)
 # ------------------------------------------------------------------------------
-async def _process_upload_bg(upload_id: int, s3_url: str, foul_hint: str):
+async def _process_upload_bg(upload_id: int, s3_url: str, foul_hint: str, notes: str = ""):
     async with async_session() as db:
         try:
             print(f"📥 Starting processing for upload_id={upload_id}")
@@ -288,15 +382,23 @@ async def _process_upload_bg(upload_id: int, s3_url: str, foul_hint: str):
             frames = _extract_frames(video_bytes, fps=1, max_frames=6)
             print(f"📸 Extracted {len(frames)} frames")
 
-            summary = await _summarize_frames_async(frames)
+            summary = await _summarize_frames_async(frames, foul_hint=foul_hint, notes=notes)
             print(f"✍️ Summary: {summary}")
 
             # 3) Retrieve rules (async)
-            retrieved = await _retrieve_rules_async(summary, top_k=3)
+            retrieval_query = "\n".join(
+                part for part in [summary, f"Foul hint: {foul_hint}" if foul_hint else "", notes] if part
+            )
+            retrieved = await _retrieve_rules_async(retrieval_query, top_k=6)
             print(f"📚 Retrieved {len(retrieved)} rules")
             
             # 4) Decide with LLM
-            label, confidence, explanation_text = await _predict_with_rules(summary, retrieved)
+            label, confidence, explanation_text = await _predict_with_rules(
+                summary,
+                retrieved,
+                foul_hint=foul_hint,
+                notes=notes,
+            )
             print(f"📊 Predicted: {label} (confidence={confidence})")
 
             # 4b) Confidence thresholding
@@ -346,6 +448,7 @@ async def upload_video(
     foul_type: str = Form(...),
     notes: str = Form(""),
     db: AsyncSession = Depends(get_db),
+    _auth: None = Depends(require_api_key),
 ):
     print("📥 Upload request received")
 
@@ -383,7 +486,7 @@ async def upload_video(
             await db.refresh(rec)
             print("✅ DB write complete with ID:", rec.id)
 
-            asyncio.create_task(_process_upload_bg(rec.id, s3_url, foul_type))
+            asyncio.create_task(_process_upload_bg(rec.id, s3_url, foul_type, notes))
             response = UploadResponse(id=rec.id, s3_url=s3_url)
             print("✅ UploadResponse ready:", response.dict())
             return response
@@ -398,7 +501,11 @@ async def upload_video(
 app.add_api_route("/api/upload", upload_video, methods=["POST"])
 
 @app.get("/api/plays")
-async def list_recent_plays(limit: int = Query(25, ge=1, le=200), db: AsyncSession = Depends(get_db)) -> List[dict]:
+async def list_recent_plays(
+    limit: int = Query(25, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+    _auth: None = Depends(require_api_key),
+) -> List[dict]:
     try:
         result = await db.execute(
             select(Upload)
@@ -438,7 +545,11 @@ def health_check():
     return {"status": "ok"}
 
 @app.post("/api/retry/{upload_id}")
-async def retry_upload(upload_id: int, db: AsyncSession = Depends(get_db)):
+async def retry_upload(
+    upload_id: int,
+    db: AsyncSession = Depends(get_db),
+    _auth: None = Depends(require_api_key),
+):
     """Mark upload queued and re-run async background worker."""
     # Fetch the row using async session
     result = await db.execute(select(Upload).where(Upload.id == upload_id))
@@ -454,12 +565,16 @@ async def retry_upload(upload_id: int, db: AsyncSession = Depends(get_db)):
     await db.commit()
 
     # Launch async background worker (non-blocking)
-    asyncio.create_task(_process_upload_bg(row.id, row.s3_url, row.foul_type))
+    asyncio.create_task(_process_upload_bg(row.id, row.s3_url, row.foul_type, row.notes or ""))
 
     return {"ok": True, "id": upload_id}
 
 @app.patch("/api/plays/{upload_id}/review")
-def set_human_review(upload_id: int, payload: ReviewPayload):
+def set_human_review(
+    upload_id: int,
+    payload: ReviewPayload,
+    _auth: None = Depends(require_api_key),
+):
     db: Session = SessionLocal()
     try:
         row = db.query(Upload).get(upload_id)
@@ -485,12 +600,16 @@ def set_human_review(upload_id: int, payload: ReviewPayload):
 # Rules: quick search (already handy for sanity checks)
 # ------------------------------------------------------------------------------
 @app.get("/api/rules/search")
-def search_rules(q: str = Query(..., min_length=2), k: int = Query(3, ge=1, le=10)):
+async def search_rules(
+    q: str = Query(..., min_length=2),
+    k: int = Query(3, ge=1, le=10),
+    _auth: None = Depends(require_api_key),
+):
     """
     Simple retrieval endpoint to sanity-check embeddings & pgvector search.
     """
     try:
-        emb = _embed_text(q)  # 3072-D
+        emb = await _embed_text(q)  # 3072-D
         qvec_literal = "[" + ",".join(f"{x:.6f}" for x in emb) + "]"
         sql = sqltext("""
             SELECT id, title, section, body,
@@ -526,7 +645,11 @@ class ReviewIn(BaseModel):
     override_prediction: Optional[bool] = False
 
 @app.post("/api/review/{upload_id}")
-def submit_review(upload_id: int, payload: ReviewIn = Body(...)):
+def submit_review(
+    upload_id: int,
+    payload: ReviewIn = Body(...),
+    _auth: None = Depends(require_api_key),
+):
     """
     Save human review info. If override_prediction=True and human_label is provided,
     copy human_label into prediction_label.

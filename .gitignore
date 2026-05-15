@@ -1,26 +1,23 @@
+# Environment and secrets
 .env
-.env
-.env
-.env
+.env.*
+
+# Python
 venv/
 .venv/
 __pycache__/
-*.pyc
-.DS_Store
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
-# local only
-.env
-.env.*
-venv/
-__pycache__/
+# Local data and generated files
+uploads/
 *.sqlite
+*.db
 
-.env
-.env
-.env
-.env
-
-# local
-.env
-venv/
-__pycache__/
+# OS/editor noise
+.DS_Store
+.vscode/
+.idea/

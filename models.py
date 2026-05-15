@@ -30,11 +30,13 @@ class Rule(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     title = Column(String, index=True)
-    content = Column(Text)
+    section = Column(Text)
+    body = Column(Text)
 
     def as_dict(self):
         return {
             "id": self.id,
             "title": self.title,
-            "content": self.content
+            "section": self.section,
+            "body": self.body,
         }
