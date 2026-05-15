@@ -14,7 +14,7 @@ import boto3
 from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, Query, Body, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, func, or_
 from sqlalchemy import select
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy import text as sqltext
@@ -515,18 +515,44 @@ app.add_api_route("/api/upload", upload_video, methods=["POST"])
 @app.get("/api/plays")
 async def list_recent_plays(
     limit: int = Query(25, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    status: Optional[str] = Query(None),
+    reviewed: Optional[bool] = Query(None),
+    q: Optional[str] = Query(None, min_length=1),
     db: AsyncSession = Depends(get_db),
     _auth: None = Depends(require_api_key),
-) -> List[dict]:
+):
     try:
+        filters = []
+        if status:
+            filters.append(Upload.status == status)
+        if reviewed is not None:
+            filters.append(Upload.reviewed_at.isnot(None) if reviewed else Upload.reviewed_at.is_(None))
+        if q:
+            pattern = f"%{q.strip()}%"
+            filters.append(or_(
+                Upload.foul_type.ilike(pattern),
+                Upload.notes.ilike(pattern),
+                Upload.prediction_label.ilike(pattern),
+                Upload.human_label.ilike(pattern),
+            ))
+
         result = await db.execute(
             select(Upload)
+            .where(*filters)
             .order_by(Upload.id.desc())
+            .offset(offset)
             .limit(limit)
         )
         rows = result.scalars().all()
+        total_result = await db.execute(
+            select(func.count())
+            .select_from(Upload)
+            .where(*filters)
+        )
+        total = total_result.scalar_one()
 
-        out = []
+        items = []
         for r in rows:
             key = _s3_key_from_url(r.s3_url)
             presigned = _presign(key, 3600)
@@ -537,7 +563,7 @@ async def list_recent_plays(
                 and r.prediction_label
             ):
                 official_agrees = r.human_label == r.prediction_label
-            out.append({
+            items.append({
                 "id": r.id,
                 "foul_type": r.foul_type,
                 "notes": r.notes,
@@ -556,7 +582,13 @@ async def list_recent_plays(
                 "s3_url": r.s3_url,
                 "presigned_url": presigned,
             })
-        return out
+        return {
+            "items": items,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "has_more": offset + len(items) < total,
+        }
     except Exception as e:
         return {"ok": False, "error": str(e)}
 

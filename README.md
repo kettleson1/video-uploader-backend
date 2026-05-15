@@ -134,7 +134,7 @@ http://localhost:8000/api/docs
 | `/health` | GET | Basic health check |
 | `/upload` | POST | Upload a video clip |
 | `/api/upload` | POST | Alias for video upload |
-| `/api/plays` | GET | List recent uploaded plays and processing results |
+| `/api/plays` | GET | List uploaded plays with pagination and filters |
 | `/api/retry/{upload_id}` | POST | Re-run background processing for an upload |
 | `/api/rules/list` | GET | Return rules for the frontend dropdown |
 | `/api/rules/search` | GET | Search rule snippets with pgvector |
@@ -143,6 +143,8 @@ http://localhost:8000/api/docs
 | `/api/plays/{upload_id}/review` | PATCH | Save or clear human review data |
 
 ## Upload Flow
+
+`/api/plays` accepts `limit`, `offset`, `status`, `reviewed`, and `q` query parameters. It returns `items`, `total`, `limit`, `offset`, and `has_more` so the frontend can page through results without a hard display cap.
 
 1. The frontend posts multipart form data with:
    - `file`
