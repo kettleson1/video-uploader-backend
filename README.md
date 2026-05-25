@@ -35,6 +35,7 @@ database.py             Async database connection setup
 ingest_rules.py         Loads rule text files into Postgres with embeddings
 video_processor.py      More advanced vision pipeline module, not fully wired into main.py yet
 rules/                  Local rule snippet source files
+golden-dataset/         NFHS golden dataset labels and candidate review metadata
 agents.md               Current agent/pipeline notes
 requirements.txt        Runtime Python dependencies
 requirements_additions.txt  Optional/additional video-processing dependency notes
@@ -173,6 +174,36 @@ The current `rules/` files are usable for early retrieval testing, but many are 
 - Closely related fouls that may be confused with it.
 
 Better source chunks will improve retrieval more than prompt tuning alone.
+
+## Golden Dataset
+
+The `golden-dataset/` folder tracks the NFHS/high-school regression set for DAVE model and prompt changes.
+
+Tracked in git:
+
+- `golden-dataset/labels.csv`: final expected labels/results for approved and planned clips.
+- `golden-dataset/candidate_sources.csv`: human-review checklist with exact MIBT candidate source pages.
+- `golden-dataset/candidate_review.html`: lightweight review index for browsing candidate sources.
+- `golden-dataset/videos/.gitkeep`: placeholder for the local video folder.
+
+Not tracked in git:
+
+- Actual `.mov` and `.mp4` clips under `golden-dataset/videos/`.
+
+Current approved clips:
+
+| ID | Filename | Expected result | Expected label | Notes |
+| --- | --- | --- | --- | --- |
+| `002` | `002_obvious_dpi_early_contact.mov` | `FOUL` | `pass_interference_defense` | DPI category: early contact. |
+| `003` | `003_borderline_dpi_arm_restrict.mov` | `FOUL` | `pass_interference_defense` | DPI category: arm bar/body restriction. |
+| `004` | `004_no_foul_no_pass_interference.mov` | `NO FOUL` | `None` | No-foul pass-interference review example. |
+
+When a human approves a new clip:
+
+1. Save the local clip in `golden-dataset/videos/` using the planned filename from `candidate_sources.csv`.
+2. Mark the row in `candidate_sources.csv` as `approved`.
+3. Update the matching row in `labels.csv` with the final `expected_label`, `expected_result`, rule reference, and notes.
+4. Keep the video file local unless there is a separate approved storage location for large/private clips.
 
 ## Development Checks
 

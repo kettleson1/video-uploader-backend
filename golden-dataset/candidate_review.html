@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Dave NFHS Golden Dataset Candidate Review</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 24px; color: #1f2933; line-height: 1.35; }
+    h1 { font-size: 24px; margin-bottom: 8px; }
+    p { max-width: 960px; }
+    table { border-collapse: collapse; width: 100%; font-size: 14px; }
+    th, td { border: 1px solid #d9e2ec; padding: 8px; vertical-align: top; }
+    th { background: #f0f4f8; text-align: left; position: sticky; top: 0; }
+    tr:nth-child(even) { background: #fbfcfd; }
+    .status { white-space: nowrap; font-weight: 700; color: #7c2d12; }
+    a { color: #0b5cad; }
+  </style>
+</head>
+<body>
+  <h1>Dave NFHS Golden Dataset Candidate Review</h1>
+  <p>These are high-school/NFHS-oriented candidate sources only. They are not approved golden clips until a human selects the exact play segment, confirms the NFHS ruling, and places the local video in <code>golden-dataset/videos/</code>.</p>
+  <p><strong>Primary source:</strong> MIBT high-school football officiating clips accessed through the subscribed Chrome profile. The exact candidate page for each planned dataset row is listed in <code>candidate_sources.csv</code>.</p>
+  <table>
+    <thead>
+      <tr>
+        <th>Range</th>
+        <th>Category</th>
+        <th>Primary NFHS/high-school source</th>
+        <th>Review note</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td>001-005</td><td>Defensive pass interference</td><td><a href="https://mibt.org/video/defensive-pass-interference-fundamentals/">MIBT DPI fundamentals</a></td><td>Choose obvious and borderline DPI clips, including early contact, armbar, and playing-through-body cases.</td></tr>
+      <tr><td>006-010</td><td>Offensive pass interference</td><td><a href="https://mibt.org/video/opi-called-but-bad-angle-by-b-mechanics-and-crew-communication/">MIBT OPI called but bad angle</a></td><td>Choose push-off, pick/screen, and borderline hand-fighting cases.</td></tr>
+      <tr><td>011-015</td><td>Holding</td><td><a href="https://mibt.org/video/missed-holding-on-left-tackle-mechanics-on-suspect-fumble-downfield/">MIBT missed holding on left tackle</a></td><td>Use NFHS material-restriction and point-of-attack guidance.</td></tr>
+      <tr><td>016-018</td><td>No foul</td><td><a href="https://mibt.org/video/mutual-combat-proper-judgement-defensive-pass-interference-call/">MIBT no-flag mutual combat</a></td><td>Select negative controls: clean coverage, legal hand fighting, legal block.</td></tr>
+      <tr><td>019-021</td><td>Illegal formation / motion / shift</td><td><a href="https://mibt.org/video/is-the-right-tackle-lined-up-legally-suspect-illegal-formation/">MIBT illegal formation candidate</a></td><td>Confirm the foul is live-ball at the snap under NFHS.</td></tr>
+      <tr><td>022-024</td><td>Personal fouls</td><td><a href="https://mibt.org/video/illegal-helmet-contact-on-qb-with-only-4-officials-targeting-with-suspect-dq-illegal-helmet-contact-rules-9-11-24/">MIBT illegal helmet contact</a></td><td>Use NFHS labels such as illegal helmet contact or horse-collar, not NCAA targeting terminology.</td></tr>
+      <tr><td>025-027</td><td>Kick/punt related fouls</td><td><a href="https://mibt.org/video/suspect-kick-catching-interference-with-receiver-making-the-fair-catch/">MIBT kick-catching interference</a></td><td>Review kick-catch interference, roughing/running into kicker, and kick out of bounds examples.</td></tr>
+    </tbody>
+  </table>
+</body>
+</html>

@@ -53,4 +53,18 @@ All long-running work stays off the request/response path thanks to `asyncio.cre
 - Confidence fallback: The user-facing `prediction_label` becomes `Uncertain` when `confidence < CONFIDENCE_THRESHOLD`. Adjust via env var rather than editing code so that Airflow/infra can override per environment.
 - Human review: `/api/review/{upload_id}` and `/api/plays/{upload_id}/review` let reviewers correct predictions. Those handlers never call an agent; they simply patch DB columns (`human_label`, `human_notes`, `reviewed_at`).
 
+## Golden Dataset Notes
+
+The repository now includes `golden-dataset/` metadata for the NFHS high-school golden evaluation set. The metadata tracks candidate source videos, approved labels, expected results, rule references, and reviewer notes.
+
+The actual video clips are intentionally not tracked in git. They should live locally in `golden-dataset/videos/` with filenames matching `labels.csv`.
+
+Current approved clips:
+
+- `002_obvious_dpi_early_contact.mov`: defensive pass interference, foul, DPI category `early_contact`.
+- `003_borderline_dpi_arm_restrict.mov`: defensive pass interference, foul, DPI category `arm_bar/body_restrict`.
+- `004_no_foul_no_pass_interference.mov`: no foul, negative-control pass-interference review clip.
+
+For MVP 1, score only the main label/result, such as `pass_interference_defense` versus `None`. DPI subcategories such as `early_contact`, `arm_bar`, `not_playing_the_ball`, `hook_and_turn`, `cutoff`, and `playing_through` should stay in notes until a later eval version adds subtype scoring.
+
 Use this document as the canonical reference before tweaking prompts, swapping models, or inserting additional LLM calls.

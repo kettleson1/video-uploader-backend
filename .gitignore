@@ -16,6 +16,8 @@ __pycache__/
 uploads/
 *.sqlite
 *.db
+golden-dataset/videos/*
+!golden-dataset/videos/.gitkeep
 
 # OS/editor noise
 .DS_Store
