@@ -18,9 +18,10 @@ from typing import Any
 from urllib import error, parse, request
 
 
-DONE_STATUSES = {"done"}
-FAILED_STATUSES = {"error"}
+DONE_STATUSES = {"done", "completed", "complete", "processed"}
+FAILED_STATUSES = {"error", "failed", "failure"}
 NO_FOUL_LABELS = {"", "none", "no_foul", "no foul", "no-foul", "no_penalty", "no penalty"}
+VALID_RESULTS = {"FOUL", "NO FOUL"}
 
 
 @dataclass
@@ -89,11 +90,40 @@ def load_labels(labels_path: Path, videos_dir: Path) -> list[GoldenClip]:
 
 
 def validate_clips(clips: list[GoldenClip]) -> None:
+    seen_ids: set[str] = set()
+    seen_files: set[str] = set()
+    duplicate_ids: list[str] = []
+    duplicate_files: list[str] = []
+    bad_results: list[str] = []
+
+    for clip in clips:
+        if clip.clip_id in seen_ids:
+            duplicate_ids.append(clip.clip_id)
+        seen_ids.add(clip.clip_id)
+
+        if clip.filename in seen_files:
+            duplicate_files.append(clip.filename)
+        seen_files.add(clip.filename)
+
+        if clip.expected_result.strip().upper() not in VALID_RESULTS:
+            bad_results.append(f"{clip.clip_id} {clip.filename}: {clip.expected_result}")
+
     missing = [clip.filename for clip in clips if not clip.video_path.exists()]
+    problems: list[str] = []
+
+    if duplicate_ids:
+        problems.append("Duplicate ids:\n" + "\n".join(f"  - {value}" for value in duplicate_ids))
+    if duplicate_files:
+        problems.append("Duplicate filenames:\n" + "\n".join(f"  - {value}" for value in duplicate_files))
+    if bad_results:
+        problems.append("Invalid expected_result values:\n" + "\n".join(f"  - {value}" for value in bad_results))
     if missing:
         preview = "\n".join(f"  - {name}" for name in missing[:20])
         extra = "" if len(missing) <= 20 else f"\n  ... and {len(missing) - 20} more"
-        raise FileNotFoundError(f"Missing video files:\n{preview}{extra}")
+        problems.append(f"Missing video files:\n{preview}{extra}")
+
+    if problems:
+        raise ValueError("\n\n".join(problems))
 
 
 def http_json(method: str, url: str, api_key: str, body: bytes | None = None, headers: dict[str, str] | None = None) -> Any:
@@ -208,9 +238,12 @@ def score_clip(clip: GoldenClip, play: dict[str, Any]) -> dict[str, Any]:
         "expected_label": expected_label_norm,
         "predicted_label": predicted_label_norm,
         "label_correct": label_correct,
+        "overall_correct": result_correct and label_correct,
+        "rule_reference": clip.rule_reference,
         "confidence": play.get("confidence"),
         "error_message": play.get("error_message"),
         "explanation": play.get("explanation"),
+        "notes": clip.notes,
     }
 
 
@@ -227,9 +260,12 @@ def write_report(path: Path, rows: list[dict[str, Any]]) -> None:
         "expected_label",
         "predicted_label",
         "label_correct",
+        "overall_correct",
+        "rule_reference",
         "confidence",
         "error_message",
         "explanation",
+        "notes",
     ]
     with path.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -239,14 +275,21 @@ def write_report(path: Path, rows: list[dict[str, Any]]) -> None:
 
 def print_summary(rows: list[dict[str, Any]], report_path: Path) -> None:
     total = len(rows)
+    overall_hits = sum(1 for row in rows if row["overall_correct"])
     result_hits = sum(1 for row in rows if row["result_correct"])
     label_hits = sum(1 for row in rows if row["label_correct"])
-    misses = [row for row in rows if not row["label_correct"] or not row["result_correct"]]
+    misses = [row for row in rows if not row["overall_correct"]]
+
+    def pct(value: int) -> str:
+        return f"{(value / total * 100):.1f}%" if total else "0.0%"
 
     print("\nGolden dataset eval complete")
+    print(f"Total plays: {total}")
+    print(f"Correct: {overall_hits}")
+    print(f"Accuracy: {pct(overall_hits)}")
+    print(f"Result accuracy: {result_hits}/{total} ({pct(result_hits)})")
+    print(f"Label accuracy:  {label_hits}/{total} ({pct(label_hits)})")
     print(f"Report: {report_path}")
-    print(f"Result accuracy: {result_hits}/{total}")
-    print(f"Label accuracy:  {label_hits}/{total}")
     if misses:
         print("\nMisses:")
         for row in misses:
@@ -272,6 +315,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout-seconds", type=int, default=900)
     parser.add_argument("--poll-seconds", type=int, default=10)
     parser.add_argument("--limit", type=int, default=None, help="Run only the first N clips.")
+    parser.add_argument("--ids", default="", help="Comma-separated clip ids to run, for example: 001,007,025.")
     parser.add_argument("--validate-only", action="store_true", help="Check labels/videos without uploading.")
     return parser.parse_args()
 
@@ -283,6 +327,13 @@ def main() -> int:
         return 2
 
     clips = load_labels(args.labels, args.videos_dir)
+    if args.ids:
+        requested = {value.strip() for value in args.ids.split(",") if value.strip()}
+        clips = [clip for clip in clips if clip.clip_id in requested]
+        missing_ids = requested - {clip.clip_id for clip in clips}
+        if missing_ids:
+            print(f"Unknown clip ids: {', '.join(sorted(missing_ids))}", file=sys.stderr)
+            return 2
     if args.limit:
         clips = clips[: args.limit]
     validate_clips(clips)

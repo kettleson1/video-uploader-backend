@@ -237,6 +237,12 @@ For a local file check without uploading:
 python3 eval_golden_dataset.py --validate-only
 ```
 
+To run only specific clips while debugging:
+
+```bash
+python3 eval_golden_dataset.py --ids 001,007,025
+```
+
 The script uploads each local clip, waits for processing to finish, compares DAVE's prediction against `golden-dataset/labels.csv`, prints misses, and writes a CSV report under `golden-dataset/reports/`.
 
 ## Development Checks
