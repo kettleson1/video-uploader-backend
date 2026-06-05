@@ -11,6 +11,7 @@ Use these same high-school clips after every prompt, rule, backend, or model cha
 ```text
 golden-dataset/
   videos/
+  reports/
   labels.csv
   candidate_sources.csv
   candidate_review.html
@@ -55,3 +56,21 @@ id,filename,expected_label,expected_result,rule_reference,notes
 2. Keep filenames exactly aligned with `labels.csv`.
 3. Keep the `id` stable once a clip is part of the dataset.
 4. Score `FOUL` / `NO FOUL` separately from the specific foul label so false positives are easy to spot.
+
+## Running the Eval
+
+From the backend repo:
+
+```bash
+export DAVE_API_BASE_URL=https://your-backend-host
+export DAVE_API_KEY=your-shared-api-key
+python3 eval_golden_dataset.py
+```
+
+To check labels and local files without uploading:
+
+```bash
+python3 eval_golden_dataset.py --validate-only
+```
+
+Reports are written to `golden-dataset/reports/`. Generated report CSV files are local-only and are not committed by default.

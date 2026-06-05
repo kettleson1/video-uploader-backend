@@ -18,6 +18,8 @@ uploads/
 *.db
 golden-dataset/videos/*
 !golden-dataset/videos/.gitkeep
+golden-dataset/reports/*
+!golden-dataset/reports/.gitkeep
 
 # OS/editor noise
 .DS_Store

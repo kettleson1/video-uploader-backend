@@ -6,9 +6,9 @@ The first DAVE golden dataset has been created with 27 approved NFHS/high-school
 
 Immediate next steps:
 
-1. Build a repeatable eval runner that uploads each local golden clip and records DAVE's prediction.
-2. Compare each prediction against `golden-dataset/labels.csv`.
-3. Report accuracy by result (`FOUL` vs `NO FOUL`) and by expected label.
+1. Run `eval_golden_dataset.py` against the live backend to produce the first baseline report.
+2. Review misses and decide whether each miss is a model issue, prompt issue, rule-retrieval issue, or label issue.
+3. Track accuracy by result (`FOUL` vs `NO FOUL`) and by expected label.
 4. Flag regressions after any prompt, rule, backend, or model change.
 5. Keep the `.mov` clips local or move them to an approved private storage location before adding any automated cloud eval.
 

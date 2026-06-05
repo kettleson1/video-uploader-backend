@@ -36,6 +36,7 @@ ingest_rules.py         Loads rule text files into Postgres with embeddings
 video_processor.py      More advanced vision pipeline module, not fully wired into main.py yet
 rules/                  Local rule snippet source files
 golden-dataset/         NFHS golden dataset labels and candidate review metadata
+eval_golden_dataset.py  Uploads golden clips and reports model misses
 agents.md               Current agent/pipeline notes
 requirements.txt        Runtime Python dependencies
 requirements_additions.txt  Optional/additional video-processing dependency notes
@@ -192,10 +193,12 @@ Tracked in git:
 - `golden-dataset/candidate_sources.csv`: human-review checklist with exact MIBT candidate source pages.
 - `golden-dataset/candidate_review.html`: lightweight review index for browsing candidate sources.
 - `golden-dataset/videos/.gitkeep`: placeholder for the local video folder.
+- `golden-dataset/reports/.gitkeep`: placeholder for generated eval reports.
 
 Not tracked in git:
 
 - Actual `.mov` and `.mp4` clips under `golden-dataset/videos/`.
+- Generated eval CSV reports under `golden-dataset/reports/`.
 
 Current approved label coverage:
 
@@ -219,6 +222,22 @@ When a human approves a new clip:
 2. Mark the row in `candidate_sources.csv` as `approved`.
 3. Update the matching row in `labels.csv` with the final `expected_label`, `expected_result`, rule reference, and notes.
 4. Keep the video file local unless there is a separate approved storage location for large/private clips.
+
+Run the golden dataset eval:
+
+```bash
+export DAVE_API_BASE_URL=https://your-backend-host
+export DAVE_API_KEY=your-shared-api-key
+python3 eval_golden_dataset.py
+```
+
+For a local file check without uploading:
+
+```bash
+python3 eval_golden_dataset.py --validate-only
+```
+
+The script uploads each local clip, waits for processing to finish, compares DAVE's prediction against `golden-dataset/labels.csv`, prints misses, and writes a CSV report under `golden-dataset/reports/`.
 
 ## Development Checks
 

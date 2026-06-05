@@ -21,11 +21,14 @@ Tracked files:
 - `golden-dataset/candidate_review.html`
 - `golden-dataset/README.md`
 - `golden-dataset/videos/.gitkeep`
+- `golden-dataset/reports/.gitkeep`
+- `eval_golden_dataset.py`
 
 Local-only files:
 
 - `golden-dataset/videos/*.mov`
 - `golden-dataset/videos/*.mp4`
+- `golden-dataset/reports/*.csv`
 
 Approved coverage:
 
@@ -40,6 +43,6 @@ Approved coverage:
 
 For MVP 1, the eval should compare the main result and label only. DPI subcategories are captured in notes for future subtype scoring.
 
-Next Codex task:
+Eval runner:
 
-- Add an eval script that runs the 27 local clips against the backend and writes a simple pass/fail report against `golden-dataset/labels.csv`.
+- `eval_golden_dataset.py` validates the local video files, uploads the clips one at a time, waits for backend processing, compares predictions to `golden-dataset/labels.csv`, prints misses, and writes a CSV report under `golden-dataset/reports/`.
