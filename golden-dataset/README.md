@@ -20,17 +20,17 @@ Put the actual `.mov` or `.mp4` files in `videos/` using the exact filenames in 
 
 `candidate_sources.csv` and `candidate_review.html` are working files for human review. They list NFHS/high-school-oriented source videos that may contain useful plays, but those rows are not approved golden clips until a human selects the exact play segment and confirms the NFHS ruling.
 
-## Current Dataset Plan
+## Current Dataset Status
 
-The starter label file contains 27 planned clips:
+The starter golden dataset now contains 27 approved local clips:
 
-- 5 defensive pass interference
-- 5 offensive pass interference
-- 5 holding
-- 3 no foul
-- 3 illegal formation, illegal motion, or illegal shift
-- 3 personal fouls
-- 3 kick/punt related fouls
+- 16 foul clips
+- 11 no-foul clips
+- Defensive and offensive pass interference examples
+- Holding and block-in-the-back examples
+- Formation/motion/shift examples
+- Personal-foul examples
+- Kick-play examples
 
 Include both obvious and borderline plays. Borderline plays are especially valuable because they expose whether the model understands NFHS rule details instead of only obvious contact.
 
@@ -49,13 +49,9 @@ id,filename,expected_label,expected_result,rule_reference,notes
 - `rule_reference`: supporting NFHS rule reference when applicable
 - `notes`: human reason for the ruling and common model confusion to avoid
 
-## First Clip
-
-`001_york_gbs_dpi.mov` is reserved for the DPI clip already identified as the first golden item.
-
 ## Before Running Evals
 
-1. Add the real video files to `golden-dataset/videos/`.
+1. Confirm the local video files are present in `golden-dataset/videos/`.
 2. Keep filenames exactly aligned with `labels.csv`.
-3. Replace any placeholder row whose clip does not match the planned situation.
-4. Keep the `id` stable once a clip is part of the dataset.
+3. Keep the `id` stable once a clip is part of the dataset.
+4. Score `FOUL` / `NO FOUL` separately from the specific foul label so false positives are easy to spot.

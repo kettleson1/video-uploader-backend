@@ -179,6 +179,13 @@ Better source chunks will improve retrieval more than prompt tuning alone.
 
 The `golden-dataset/` folder tracks the NFHS/high-school regression set for DAVE model and prompt changes.
 
+Dataset status:
+
+- 27 approved high-school/NFHS clips have been created locally.
+- The label manifest contains 16 foul clips and 11 no-foul clips.
+- The local video files match the filenames in `golden-dataset/labels.csv`.
+- The large `.mov` files are intentionally kept out of git; the repo tracks the labels, sources, and review notes.
+
 Tracked in git:
 
 - `golden-dataset/labels.csv`: final expected labels/results for approved and planned clips.
@@ -190,13 +197,21 @@ Not tracked in git:
 
 - Actual `.mov` and `.mp4` clips under `golden-dataset/videos/`.
 
-Current approved clips:
+Current approved label coverage:
 
-| ID | Filename | Expected result | Expected label | Notes |
-| --- | --- | --- | --- | --- |
-| `002` | `002_obvious_dpi_early_contact.mov` | `FOUL` | `pass_interference_defense` | DPI category: early contact. |
-| `003` | `003_borderline_dpi_arm_restrict.mov` | `FOUL` | `pass_interference_defense` | DPI category: arm bar/body restriction. |
-| `004` | `004_no_foul_no_pass_interference.mov` | `NO FOUL` | `None` | No-foul pass-interference review example. |
+| Expected label | Clip count |
+| --- | --- |
+| `None` / no foul | 11 |
+| `pass_interference_defense` | 4 |
+| `pass_interference_offense` | 2 |
+| `holding` | 3 |
+| `illegal_block_in_back` | 1 |
+| `illegal_formation` | 1 |
+| `illegal_blindside_block` | 1 |
+| `targeting` | 1 |
+| `horse_collar_tackle` | 1 |
+| `roughing_the_kicker` | 1 |
+| `free_kick_out_of_bounds` | 1 |
 
 When a human approves a new clip:
 
