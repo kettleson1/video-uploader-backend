@@ -46,3 +46,37 @@ For MVP 1, the eval should compare the main result and label only. DPI subcatego
 Eval runner:
 
 - `eval_golden_dataset.py` validates the local video files, uploads the clips one at a time, waits for backend processing, compares predictions to `golden-dataset/labels.csv`, prints misses, and writes a CSV report under `golden-dataset/reports/`.
+
+## Local Setup Progress - June 7, 2026
+
+Current branch:
+
+- `codex/golden-eval-runner`
+
+Completed locally:
+
+- Pulled the latest branch from GitHub.
+- Cleared a stale `.git/HEAD.lock` that blocked Git updates.
+- Added the actual 27 golden video files under `golden-dataset/videos/`.
+- Confirmed `python3 eval_golden_dataset.py --validate-only` passes for all 27 clips.
+- Created a fresh `.venv` because the old `venv/` folder was incomplete.
+- Installed `requirements.txt`; `asyncpg` import now works in `.venv`.
+- Started the backend successfully with `python -m uvicorn main:app --reload --host 0.0.0.0 --port 8000`.
+- Added `DAVE_API_KEY` to local environment configuration.
+- Confirmed the eval request can authenticate and reach `/api/upload`.
+- Confirmed S3 upload works for the first golden clip.
+
+Remaining blocker:
+
+- `/api/upload` fails after S3 upload when writing the upload row to Postgres.
+- A direct local Postgres connection check to the configured AWS RDS database timed out.
+- Next work should be completed on the AWS side: allow the current client IP to reach the RDS security group on PostgreSQL port `5432`, confirm the DB is publicly accessible for local testing, or run the backend from inside the AWS VPC.
+
+Next command after AWS/RDS access is fixed:
+
+```bash
+source .venv/bin/activate
+export DAVE_API_BASE_URL=http://127.0.0.1:8000
+export DAVE_API_KEY=your-shared-api-key
+python3 eval_golden_dataset.py --ids 001,027
+```

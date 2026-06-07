@@ -120,7 +120,8 @@ This reads every `rules/*.txt` file, creates an embedding from the rule title an
 ## Run the API
 
 ```bash
-uvicorn main:app --reload --host 0.0.0.0 --port 8000
+source .venv/bin/activate
+python -m uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
 
 API docs are available at:
@@ -244,6 +245,33 @@ python3 eval_golden_dataset.py --ids 001,007,025
 ```
 
 The script uploads each local clip, waits for processing to finish, compares DAVE's prediction against `golden-dataset/labels.csv`, prints misses, and writes a CSV report under `golden-dataset/reports/`.
+
+### Local Eval Setup Progress
+
+As of June 7, 2026, local setup has been advanced through these checks:
+
+- Git branch `codex/golden-eval-runner` was fetched and checked out locally.
+- A stale `.git/HEAD.lock` was cleared so Git could update normally.
+- The 27 local golden video files were placed under `golden-dataset/videos/`.
+- `python3 eval_golden_dataset.py --validate-only` passed with 27 clips.
+- A fresh `.venv` was created because the old `venv/` folder was incomplete.
+- Dependencies from `requirements.txt` installed successfully, including `asyncpg`.
+- The FastAPI backend starts locally with `python -m uvicorn main:app --reload --host 0.0.0.0 --port 8000`.
+- `DAVE_API_KEY` was added to `.env` and the eval request reached `/api/upload`.
+- S3 upload succeeded for `001_york_gbs_dpi.mov`.
+
+Current blocker:
+
+- The local backend cannot write the upload record to the configured AWS RDS Postgres database. Direct connection testing timed out, which points to AWS/RDS network access rather than local Python setup. Check the RDS security group inbound rules for PostgreSQL port `5432`, confirm the database is publicly accessible if testing from a Mac, or run the backend from inside the same AWS VPC.
+
+After the AWS/RDS access issue is fixed, restart the backend and run:
+
+```bash
+source .venv/bin/activate
+export DAVE_API_BASE_URL=http://127.0.0.1:8000
+export DAVE_API_KEY=your-shared-api-key
+python3 eval_golden_dataset.py --ids 001,027
+```
 
 ## Development Checks
 
