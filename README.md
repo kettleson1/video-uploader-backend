@@ -275,6 +275,12 @@ To run only specific clips while debugging:
 python3 eval_golden_dataset.py --ids 001,007,025
 ```
 
+If a large clip upload times out, rerun only the remaining clip IDs. The eval runner uses a longer request timeout by default, and it can be increased if needed:
+
+```bash
+python3 eval_golden_dataset.py --ids 021,022,023,024,025,026,027 --request-timeout-seconds 600
+```
+
 The script uploads each local clip, waits for processing to finish, compares DAVE's prediction against `golden-dataset/labels.csv`, prints misses, and writes a CSV report under `golden-dataset/reports/`.
 
 ### Local Eval Setup Progress

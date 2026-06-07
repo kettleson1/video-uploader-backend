@@ -126,13 +126,20 @@ def validate_clips(clips: list[GoldenClip]) -> None:
         raise ValueError("\n\n".join(problems))
 
 
-def http_json(method: str, url: str, api_key: str, body: bytes | None = None, headers: dict[str, str] | None = None) -> Any:
+def http_json(
+    method: str,
+    url: str,
+    api_key: str,
+    body: bytes | None = None,
+    headers: dict[str, str] | None = None,
+    timeout_seconds: int = 60,
+) -> Any:
     req_headers = {"X-DAVE-API-Key": api_key}
     if headers:
         req_headers.update(headers)
     req = request.Request(url, data=body, headers=req_headers, method=method)
     try:
-        with request.urlopen(req, timeout=60) as response:
+        with request.urlopen(req, timeout=timeout_seconds) as response:
             payload = response.read().decode("utf-8")
     except error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
@@ -173,7 +180,7 @@ def multipart_body(fields: dict[str, str], file_field: str, file_path: Path) -> 
     return b"".join(chunks), f"multipart/form-data; boundary={boundary}"
 
 
-def upload_clip(base_url: str, api_key: str, clip: GoldenClip, run_id: str) -> int:
+def upload_clip(base_url: str, api_key: str, clip: GoldenClip, run_id: str, request_timeout_seconds: int) -> int:
     notes = f"[golden-eval:{run_id}] {clip.clip_id} {clip.filename}. Expected: {clip.expected_result} {clip.expected_label}. {clip.notes}"
     body, content_type = multipart_body(
         fields={"foul_type": clip.expected_label, "notes": notes},
@@ -186,6 +193,7 @@ def upload_clip(base_url: str, api_key: str, clip: GoldenClip, run_id: str) -> i
         api_key,
         body=body,
         headers={"Content-Type": content_type, "Content-Length": str(len(body))},
+        timeout_seconds=request_timeout_seconds,
     )
     upload_id = response.get("id")
     if not upload_id:
@@ -193,9 +201,9 @@ def upload_clip(base_url: str, api_key: str, clip: GoldenClip, run_id: str) -> i
     return int(upload_id)
 
 
-def get_play(base_url: str, api_key: str, upload_id: int) -> dict[str, Any]:
+def get_play(base_url: str, api_key: str, upload_id: int, request_timeout_seconds: int) -> dict[str, Any]:
     url = f"{base_url.rstrip('/')}/api/plays?limit=200&offset=0"
-    response = http_json("GET", url, api_key)
+    response = http_json("GET", url, api_key, timeout_seconds=request_timeout_seconds)
     if response.get("ok") is False:
         raise RuntimeError(f"Play list failed: {response}")
     for item in response.get("items", []):
@@ -204,11 +212,18 @@ def get_play(base_url: str, api_key: str, upload_id: int) -> dict[str, Any]:
     raise RuntimeError(f"Upload id {upload_id} was not found in the latest /api/plays response")
 
 
-def wait_for_result(base_url: str, api_key: str, upload_id: int, timeout_seconds: int, poll_seconds: int) -> dict[str, Any]:
+def wait_for_result(
+    base_url: str,
+    api_key: str,
+    upload_id: int,
+    timeout_seconds: int,
+    poll_seconds: int,
+    request_timeout_seconds: int,
+) -> dict[str, Any]:
     deadline = time.monotonic() + timeout_seconds
     last_play: dict[str, Any] | None = None
     while time.monotonic() < deadline:
-        play = get_play(base_url, api_key, upload_id)
+        play = get_play(base_url, api_key, upload_id, request_timeout_seconds)
         last_play = play
         status = str(play.get("status") or "").lower()
         if status in DONE_STATUSES or status in FAILED_STATUSES:
@@ -314,6 +329,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--report", type=Path, default=default_report)
     parser.add_argument("--timeout-seconds", type=int, default=900)
     parser.add_argument("--poll-seconds", type=int, default=10)
+    parser.add_argument(
+        "--request-timeout-seconds",
+        type=int,
+        default=300,
+        help="HTTP request timeout for large video uploads and polling requests.",
+    )
     parser.add_argument("--limit", type=int, default=None, help="Run only the first N clips.")
     parser.add_argument("--ids", default="", help="Comma-separated clip ids to run, for example: 001,007,025.")
     parser.add_argument("--validate-only", action="store_true", help="Check labels/videos without uploading.")
@@ -350,9 +371,16 @@ def main() -> int:
     rows: list[dict[str, Any]] = []
     for index, clip in enumerate(clips, start=1):
         print(f"\n[{index}/{len(clips)}] Uploading {clip.filename}")
-        upload_id = upload_clip(args.base_url, args.api_key, clip, run_id)
+        upload_id = upload_clip(args.base_url, args.api_key, clip, run_id, args.request_timeout_seconds)
         print(f"Upload id {upload_id}; waiting for result...")
-        play = wait_for_result(args.base_url, args.api_key, upload_id, args.timeout_seconds, args.poll_seconds)
+        play = wait_for_result(
+            args.base_url,
+            args.api_key,
+            upload_id,
+            args.timeout_seconds,
+            args.poll_seconds,
+            args.request_timeout_seconds,
+        )
         scored = score_clip(clip, play)
         rows.append(scored)
         mark = "PASS" if scored["result_correct"] and scored["label_correct"] else "MISS"
