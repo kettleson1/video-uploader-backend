@@ -65,14 +65,18 @@ Completed locally:
 - Added `DAVE_API_KEY` to local environment configuration.
 - Confirmed the eval request can authenticate and reach `/api/upload`.
 - Confirmed S3 upload works for the first golden clip.
+- Added `check_postgres_connection.py` to diagnose local RDS/Postgres access.
+- Improved database connection setup in `database.py` with a timeout, `pool_pre_ping`, configurable SQL logging, and clearer missing-`DATABASE_URL` failure.
+- Improved `/api/upload` database error logging in `main.py` by printing `repr(...)` for DB exceptions.
+- Fixed the AWS RDS/Postgres network blocker by allowing the current local public IP through the `default` security group (`sg-0f5593b9524adac92`) on PostgreSQL/TCP port `5432`.
+- Confirmed `python check_postgres_connection.py` passes with TCP and SQLAlchemy `select 1` success.
+- Completed a two-clip golden eval with `python3 eval_golden_dataset.py --ids 001,027`.
+- Clip `001_york_gbs_dpi.mov` passed with expected label `pass_interference_defense`.
+- Clip `027_free_kick_out_of_bounds.mov` passed with expected label `free_kick_out_of_bounds`.
+- Eval summary: `2/2` correct, `100.0%` accuracy, no misses.
+- Report written locally: `golden-dataset/reports/golden_eval_20260607T180954Z.csv`.
 
-Remaining blocker:
-
-- `/api/upload` fails after S3 upload when writing the upload row to Postgres.
-- A direct local Postgres connection check to the configured AWS RDS database timed out.
-- Next work should be completed on the AWS side: allow the current client IP to reach the RDS security group on PostgreSQL port `5432`, confirm the DB is publicly accessible for local testing, or run the backend from inside the AWS VPC.
-
-Next command after AWS/RDS access is fixed:
+Next command for continued local eval testing:
 
 ```bash
 source .venv/bin/activate

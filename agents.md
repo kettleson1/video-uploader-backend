@@ -38,6 +38,7 @@ All long-running work stays off the request/response path thanks to `asyncio.cre
 ## Supporting Scripts
 
 - `ingest_rules.py` ingests every `rules/*.txt` file, calls `_embed_text`, and upserts the vectors into Postgres (requires the `vector` extension and `uq_rules_title_section` unique index). Run it whenever rule text changes.
+- `check_postgres_connection.py` verifies local TCP and SQLAlchemy connectivity to the configured RDS Postgres database before running upload/eval work.
 - `rules/` contains the canonical snippets used both for retrieval and for the predictor to cite in explanations.
 
 ## Extending the Agent Layer
@@ -75,6 +76,10 @@ As of June 7, 2026:
 - The local backend runs from a fresh `.venv` using `python -m uvicorn main:app --reload --host 0.0.0.0 --port 8000`.
 - API authentication works when the eval script exports the same `DAVE_API_KEY` value loaded by the backend.
 - The eval upload path now reaches S3; `001_york_gbs_dpi.mov` uploaded successfully during setup testing.
-- The remaining blocker is the Postgres write after S3 upload. Direct local connection testing to the configured RDS database timed out, so the next fix is AWS-side network access: RDS security group inbound PostgreSQL `5432`, public accessibility for local Mac testing, or running the backend inside the AWS VPC.
+- The AWS RDS/Postgres network blocker was fixed by adding a PostgreSQL/TCP `5432` inbound rule for the current local public IP on security group `sg-0f5593b9524adac92`.
+- `python check_postgres_connection.py` now confirms `tcp_5432=ok` and `sqlalchemy_select_1=ok value=1`.
+- A two-clip golden eval run with `--ids 001,027` passed end to end.
+- Clip `001` passed as `pass_interference_defense`; clip `027` passed as `free_kick_out_of_bounds`.
+- The report was written to `golden-dataset/reports/golden_eval_20260607T180954Z.csv` with `2/2` correct and no misses.
 
 Use this document as the canonical reference before tweaking prompts, swapping models, or inserting additional LLM calls.
