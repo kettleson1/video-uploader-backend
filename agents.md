@@ -38,6 +38,7 @@ All long-running work stays off the request/response path thanks to `asyncio.cre
 ## Supporting Scripts
 
 - `ingest_rules.py` ingests every `rules/*.txt` file, calls `_embed_text`, and upserts the vectors into Postgres (requires the `vector` extension and `uq_rules_title_section` unique index). Run it whenever rule text changes.
+- `check_postgres_connection.py` verifies local TCP and SQLAlchemy connectivity to the configured RDS Postgres database before running upload/eval work.
 - `rules/` contains the canonical snippets used both for retrieval and for the predictor to cite in explanations.
 
 ## Extending the Agent Layer
@@ -49,7 +50,7 @@ All long-running work stays off the request/response path thanks to `asyncio.cre
 
 ## Operational Notes
 
-- Secrets: `AWS_S3_BUCKET`, `DATABASE_URL`, and `OPENAI_API_KEY` must be defined (see `.env`). Missing values will raise during app startup.
+- Secrets: `AWS_S3_BUCKET`, `DATABASE_URL`, `OPENAI_API_KEY`, and `DAVE_API_KEY` must be defined in local or hosted environment configuration. Missing AWS/database/OpenAI values raise during app startup; missing or mismatched `DAVE_API_KEY` causes authenticated routes to reject eval uploads.
 - Confidence fallback: The user-facing `prediction_label` becomes `Uncertain` when `confidence < CONFIDENCE_THRESHOLD`. Adjust via env var rather than editing code so that Airflow/infra can override per environment.
 - Human review: `/api/review/{upload_id}` and `/api/plays/{upload_id}/review` let reviewers correct predictions. Those handlers never call an agent; they simply patch DB columns (`human_label`, `human_notes`, `reviewed_at`).
 
@@ -61,10 +62,28 @@ The actual video clips are intentionally not tracked in git. They should live lo
 
 Current approved clips:
 
-- `002_obvious_dpi_early_contact.mov`: defensive pass interference, foul, DPI category `early_contact`.
-- `003_borderline_dpi_arm_restrict.mov`: defensive pass interference, foul, DPI category `arm_bar/body_restrict`.
-- `004_no_foul_no_pass_interference.mov`: no foul, negative-control pass-interference review clip.
+- 27 approved local clips are listed in `golden-dataset/labels.csv`.
+- The approved set contains 16 foul clips and 11 no-foul clips.
+- Coverage includes DPI, OPI, holding, block in the back, illegal formation, illegal blindside block, targeting, horse-collar tackle, roughing the kicker, free kick out of bounds, and no-foul controls.
 
 For MVP 1, score only the main label/result, such as `pass_interference_defense` versus `None`. DPI subcategories such as `early_contact`, `arm_bar`, `not_playing_the_ball`, `hook_and_turn`, `cutoff`, and `playing_through` should stay in notes until a later eval version adds subtype scoring.
+
+## Current Local Test Status
+
+As of June 7, 2026:
+
+- `python3 eval_golden_dataset.py --validate-only` passes locally for all 27 clips.
+- The local backend runs from a fresh `.venv` using `python -m uvicorn main:app --reload --host 0.0.0.0 --port 8000`.
+- API authentication works when the eval script exports the same `DAVE_API_KEY` value loaded by the backend.
+- The eval upload path now reaches S3; `001_york_gbs_dpi.mov` uploaded successfully during setup testing.
+- The AWS RDS/Postgres network blocker was fixed by adding a PostgreSQL/TCP `5432` inbound rule for the current local public IP on security group `sg-0f5593b9524adac92`.
+- `python check_postgres_connection.py` now confirms `tcp_5432=ok` and `sqlalchemy_select_1=ok value=1`.
+- A two-clip golden eval run with `--ids 001,027` passed end to end.
+- Clip `001` passed as `pass_interference_defense`; clip `027` passed as `free_kick_out_of_bounds`.
+- The report was written to `golden-dataset/reports/golden_eval_20260607T180954Z.csv` with `2/2` correct and no misses.
+- The first full 27-clip eval attempt passed clips `001` through `020`, then timed out while uploading the large `021_no_foul_not_illegal_shift.mov` clip. This was an upload/request timeout, not a model miss.
+- `eval_golden_dataset.py` now supports `--request-timeout-seconds` and defaults to a longer request timeout for large video uploads. Resume with `--ids 021,022,023,024,025,026,027`.
+- The resumed run on June 8, 2026 passed clips `021` through `027`.
+- Combined across `golden_eval_20260607T182923Z.csv` and `golden_eval_20260608T202127Z.csv`, the golden dataset result is `27/27` correct with no misses.
 
 Use this document as the canonical reference before tweaking prompts, swapping models, or inserting additional LLM calls.

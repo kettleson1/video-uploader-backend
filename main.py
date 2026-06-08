@@ -503,11 +503,11 @@ async def upload_video(
             print("✅ UploadResponse ready:", response.dict())
             return response
         except Exception as db_error:
-            print("❌ DB write failed:", db_error)
+            print("❌ DB write failed:", repr(db_error))
             raise HTTPException(status_code=500, detail="DB write failed")
 
     except Exception as e:
-        print("❌ Unexpected error in /upload:", e)
+        print("❌ Unexpected error in /upload:", repr(e))
         raise HTTPException(status_code=500, detail="Unexpected server error")
 
 app.add_api_route("/api/upload", upload_video, methods=["POST"])

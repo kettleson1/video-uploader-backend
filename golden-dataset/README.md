@@ -73,4 +73,10 @@ To check labels and local files without uploading:
 python3 eval_golden_dataset.py --validate-only
 ```
 
+To run only a few clips while debugging:
+
+```bash
+python3 eval_golden_dataset.py --ids 001,007,025
+```
+
 Reports are written to `golden-dataset/reports/`. Generated report CSV files are local-only and are not committed by default.

@@ -32,6 +32,7 @@ Backend API for DAVE - Digital Artificial Video Evaluation. The service accepts 
 main.py                 FastAPI app, upload routes, background processing, rule search
 models.py               SQLAlchemy models for uploads and rules
 database.py             Async database connection setup
+check_postgres_connection.py  Local RDS/Postgres connectivity diagnostic
 ingest_rules.py         Loads rule text files into Postgres with embeddings
 video_processor.py      More advanced vision pipeline module, not fully wired into main.py yet
 rules/                  Local rule snippet source files
@@ -67,6 +68,36 @@ CORS_ALLOWED_ORIGINS=https://www.davesystemsinc.com,https://davesystemsinc.com,h
 `CORS_ALLOWED_ORIGINS` is a comma-separated list. If it is omitted, the backend allows the DAVE production domains and `http://localhost:3000` for local development.
 
 The database must have pgvector available. `ingest_rules.py` creates the `rules` table and vector extension if permissions allow it.
+
+## AWS RDS/Postgres Connectivity
+
+For local Mac testing, the configured AWS RDS Postgres instance must be reachable from the current public IP address.
+
+The June 7, 2026 local setup used:
+
+- RDS database: `football-metadata-db`
+- Engine: PostgreSQL
+- Region: `us-east-2`
+- Port: `5432`
+- Security group: `default` / `sg-0f5593b9524adac92`
+- Public access: enabled for local testing
+- Inbound security group rule: PostgreSQL/TCP `5432` from the current local public IP as `/32`
+
+Use the diagnostic script before running golden eval uploads:
+
+```bash
+source .venv/bin/activate
+python check_postgres_connection.py
+```
+
+A correct local setup prints:
+
+```text
+tcp_5432=ok
+sqlalchemy_select_1=ok value=1
+```
+
+If it times out, update the RDS security group inbound rule for PostgreSQL `5432` to the current public IP, or run the backend from inside the same AWS VPC.
 
 ## API Authentication
 
@@ -120,7 +151,8 @@ This reads every `rules/*.txt` file, creates an embedding from the rule title an
 ## Run the API
 
 ```bash
-uvicorn main:app --reload --host 0.0.0.0 --port 8000
+source .venv/bin/activate
+python -m uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
 
 API docs are available at:
@@ -237,7 +269,49 @@ For a local file check without uploading:
 python3 eval_golden_dataset.py --validate-only
 ```
 
+To run only specific clips while debugging:
+
+```bash
+python3 eval_golden_dataset.py --ids 001,007,025
+```
+
+If a large clip upload times out, rerun only the remaining clip IDs. The eval runner uses a longer request timeout by default, and it can be increased if needed:
+
+```bash
+python3 eval_golden_dataset.py --ids 021,022,023,024,025,026,027 --request-timeout-seconds 600
+```
+
 The script uploads each local clip, waits for processing to finish, compares DAVE's prediction against `golden-dataset/labels.csv`, prints misses, and writes a CSV report under `golden-dataset/reports/`.
+
+### Local Eval Setup Progress
+
+As of June 7, 2026, local setup has been advanced through these checks:
+
+- Git branch `codex/golden-eval-runner` was fetched and checked out locally.
+- A stale `.git/HEAD.lock` was cleared so Git could update normally.
+- The 27 local golden video files were placed under `golden-dataset/videos/`.
+- `python3 eval_golden_dataset.py --validate-only` passed with 27 clips.
+- A fresh `.venv` was created because the old `venv/` folder was incomplete.
+- Dependencies from `requirements.txt` installed successfully, including `asyncpg`.
+- The FastAPI backend starts locally with `python -m uvicorn main:app --reload --host 0.0.0.0 --port 8000`.
+- `DAVE_API_KEY` was added to `.env` and the eval request reached `/api/upload`.
+- S3 upload succeeded for `001_york_gbs_dpi.mov`.
+- AWS RDS/Postgres connectivity was fixed by enabling local access through the `default` security group for PostgreSQL port `5432`.
+- `python check_postgres_connection.py` now passes with `tcp_5432=ok` and `sqlalchemy_select_1=ok value=1`.
+- A two-clip eval run with `--ids 001,027` passed end to end.
+- The run uploaded both clips, wrote upload rows to Postgres, processed frames, retrieved rules, predicted the expected labels, and produced `100.0%` accuracy.
+- Report written locally: `golden-dataset/reports/golden_eval_20260607T180954Z.csv`.
+- The full golden dataset eval was completed across two runs. Clips `001` through `020` passed in `golden_eval_20260607T182923Z.csv`; clips `021` through `027` passed in `golden_eval_20260608T202127Z.csv`.
+- Combined result: `27/27` correct, `100.0%` accuracy, no misses.
+
+To continue local eval testing, restart the backend and run:
+
+```bash
+source .venv/bin/activate
+export DAVE_API_BASE_URL=http://127.0.0.1:8000
+export DAVE_API_KEY=your-shared-api-key
+python3 eval_golden_dataset.py
+```
 
 ## Development Checks
 
