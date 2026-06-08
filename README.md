@@ -301,6 +301,8 @@ As of June 7, 2026, local setup has been advanced through these checks:
 - A two-clip eval run with `--ids 001,027` passed end to end.
 - The run uploaded both clips, wrote upload rows to Postgres, processed frames, retrieved rules, predicted the expected labels, and produced `100.0%` accuracy.
 - Report written locally: `golden-dataset/reports/golden_eval_20260607T180954Z.csv`.
+- The full golden dataset eval was completed across two runs. Clips `001` through `020` passed in `golden_eval_20260607T182923Z.csv`; clips `021` through `027` passed in `golden_eval_20260608T202127Z.csv`.
+- Combined result: `27/27` correct, `100.0%` accuracy, no misses.
 
 To continue local eval testing, restart the backend and run:
 
@@ -308,7 +310,7 @@ To continue local eval testing, restart the backend and run:
 source .venv/bin/activate
 export DAVE_API_BASE_URL=http://127.0.0.1:8000
 export DAVE_API_KEY=your-shared-api-key
-python3 eval_golden_dataset.py --ids 001,027
+python3 eval_golden_dataset.py
 ```
 
 ## Development Checks

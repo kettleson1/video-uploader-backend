@@ -83,5 +83,7 @@ As of June 7, 2026:
 - The report was written to `golden-dataset/reports/golden_eval_20260607T180954Z.csv` with `2/2` correct and no misses.
 - The first full 27-clip eval attempt passed clips `001` through `020`, then timed out while uploading the large `021_no_foul_not_illegal_shift.mov` clip. This was an upload/request timeout, not a model miss.
 - `eval_golden_dataset.py` now supports `--request-timeout-seconds` and defaults to a longer request timeout for large video uploads. Resume with `--ids 021,022,023,024,025,026,027`.
+- The resumed run on June 8, 2026 passed clips `021` through `027`.
+- Combined across `golden_eval_20260607T182923Z.csv` and `golden_eval_20260608T202127Z.csv`, the golden dataset result is `27/27` correct with no misses.
 
 Use this document as the canonical reference before tweaking prompts, swapping models, or inserting additional LLM calls.
