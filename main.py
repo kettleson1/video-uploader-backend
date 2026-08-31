@@ -17,6 +17,7 @@ from coaches_film_detector import (
     extract_activity_samples,
     find_uncovered_intervals,
 )
+from job_queue import enqueue_job
 
 import boto3
 from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, Query, Body, HTTPException, Depends, Header
@@ -155,6 +156,9 @@ def ensure_ruleset_columns():
                 boundary_review_status TEXT DEFAULT 'unreviewed',
                 analysis_status TEXT DEFAULT 'pending',
                 analysis_version TEXT,
+                broad_screen TEXT,
+                retrieved_rules JSONB,
+                analysis_payload JSONB,
                 result TEXT,
                 prediction_label TEXT,
                 confidence DOUBLE PRECISION,
@@ -168,6 +172,9 @@ def ensure_ruleset_columns():
         conn.execute(sqltext("ALTER TABLE IF EXISTS plays ADD COLUMN IF NOT EXISTS snap_time DOUBLE PRECISION"))
         conn.execute(sqltext("ALTER TABLE IF EXISTS plays ADD COLUMN IF NOT EXISTS live_ball_end_time DOUBLE PRECISION"))
         conn.execute(sqltext("ALTER TABLE IF EXISTS plays ADD COLUMN IF NOT EXISTS boundary_flags JSONB"))
+        conn.execute(sqltext("ALTER TABLE IF EXISTS plays ADD COLUMN IF NOT EXISTS broad_screen TEXT"))
+        conn.execute(sqltext("ALTER TABLE IF EXISTS plays ADD COLUMN IF NOT EXISTS retrieved_rules JSONB"))
+        conn.execute(sqltext("ALTER TABLE IF EXISTS plays ADD COLUMN IF NOT EXISTS analysis_payload JSONB"))
         conn.execute(sqltext("CREATE INDEX IF NOT EXISTS ix_plays_game_id ON plays (game_id)"))
         conn.execute(sqltext("CREATE UNIQUE INDEX IF NOT EXISTS ix_plays_legacy_upload_id ON plays (legacy_upload_id)"))
         conn.execute(sqltext("""
@@ -236,6 +243,7 @@ def ensure_ruleset_columns():
                 id BIGSERIAL PRIMARY KEY,
                 game_id BIGINT NOT NULL,
                 play_id BIGINT,
+                job_key TEXT,
                 stage TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'queued',
                 attempts INTEGER NOT NULL DEFAULT 0,
@@ -248,6 +256,10 @@ def ensure_ruleset_columns():
                 updated_at TIMESTAMP
             )
         """))
+        conn.execute(sqltext("ALTER TABLE IF EXISTS processing_jobs ADD COLUMN IF NOT EXISTS job_key TEXT"))
+        conn.execute(sqltext("UPDATE processing_jobs SET job_key = CONCAT('legacy:', id) WHERE job_key IS NULL"))
+        conn.execute(sqltext("CREATE UNIQUE INDEX IF NOT EXISTS ix_processing_jobs_job_key ON processing_jobs (job_key)"))
+        conn.execute(sqltext("ALTER TABLE IF EXISTS processing_jobs ALTER COLUMN job_key SET NOT NULL"))
         conn.execute(sqltext("CREATE INDEX IF NOT EXISTS ix_processing_jobs_game_id ON processing_jobs (game_id)"))
         conn.execute(sqltext("CREATE INDEX IF NOT EXISTS ix_processing_jobs_play_id ON processing_jobs (play_id)"))
 
@@ -1280,20 +1292,14 @@ async def upload_game_video(
             created_at=_now_utc(),
         )
         db.add(rec)
-        await db.commit()
-        await db.refresh(rec)
-        db.add(ProcessingJob(
+        await db.flush()
+        await enqueue_job(
+            db,
+            job_key=f"game:{rec.id}:validate_upload:v1",
             game_id=rec.id,
-            stage="detect_plays",
-            status="queued",
-            attempts=0,
-            max_attempts=3,
-            available_at=_now_utc(),
-            created_at=_now_utc(),
-            updated_at=_now_utc(),
-        ))
+            stage="validate_upload",
+        )
         await db.commit()
-        asyncio.create_task(_segment_game_bg(rec.id))
         return GameUploadResponse(id=rec.id, s3_url=s3_url)
     except Exception as e:
         raise HTTPException(status_code=500, detail=_safe_err_text(e))
@@ -1522,16 +1528,6 @@ async def update_game_segments(
     game.status = "segments_ready"
     game.progress = 0.25
     game.error_message = None
-    db.add(ProcessingJob(
-        game_id=game_id,
-        stage="analyze_plays",
-        status="queued",
-        attempts=0,
-        max_attempts=3,
-        available_at=_now_utc(),
-        created_at=_now_utc(),
-        updated_at=_now_utc(),
-    ))
     await db.commit()
     return {"ok": True, "segment_count": len(clean_segments)}
 
@@ -1552,11 +1548,25 @@ async def analyze_game(
     )
     if play_count_result.scalar_one() == 0:
         raise HTTPException(status_code=409, detail="No play segments are available to analyze")
+    signature_result = await db.execute(
+        select(Play.id, Play.source_start_time, Play.source_end_time)
+        .where(Play.game_id == game_id)
+        .order_by(Play.play_number, Play.id)
+    )
+    segment_signature = hashlib.sha256(json.dumps([
+        [row.id, row.source_start_time, row.source_end_time]
+        for row in signature_result.all()
+    ]).encode("utf-8")).hexdigest()[:16]
     game.status = "queued_for_analysis"
     game.progress = max(float(game.progress or 0), 0.25)
     game.error_message = None
+    await enqueue_job(
+        db,
+        job_key=f"game:{game_id}:extract_clips:{segment_signature}",
+        game_id=game_id,
+        stage="extract_clips",
+    )
     await db.commit()
-    asyncio.create_task(_analyze_game_bg(game_id))
     return {"ok": True, "id": game_id, "status": "queued_for_analysis"}
 
 @app.post("/upload", response_model=UploadResponse)

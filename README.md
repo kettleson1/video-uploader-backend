@@ -65,6 +65,11 @@ CORS_ALLOWED_ORIGINS=https://www.davesystemsinc.com,https://davesystemsinc.com,h
 PLAY_DETECTOR_MODE=coaches_activity_with_fallback
 LEGACY_GAME_SEGMENT_SECONDS=35
 LEGACY_GAME_SEGMENT_GAP_SECONDS=5
+FULL_GAME_WORKER_CONCURRENCY=4
+FULL_GAME_CLAIM_BATCH_SIZE=8
+FULL_GAME_POLL_SECONDS=2
+FULL_GAME_STALE_SECONDS=900
+FULL_GAME_RETRY_SECONDS=15
 ```
 
 `CORS_ALLOWED_ORIGINS` is a comma-separated list. If it is omitted, the backend allows the DAVE production domains and `http://localhost:3000` for local development.
@@ -161,6 +166,23 @@ the legacy fields while the timeline API exposes the new model.
   and fall back to legacy fixed windows when no candidates are found.
 - `coaches_activity`: use only the new detector and surface detection failures.
 - `fixed_window`: use the retained legacy segmentation path.
+
+## Full-Game Worker
+
+Full-game processing runs outside the FastAPI process through PostgreSQL-backed,
+idempotently keyed jobs. Start at least one worker process alongside the API:
+
+```bash
+python full_game_worker.py
+```
+
+Workers claim jobs with `FOR UPDATE SKIP LOCKED`, so multiple worker processes
+may run safely. `FULL_GAME_WORKER_CONCURRENCY` bounds concurrent play stages
+inside each process. Interrupted running jobs return to the queue after
+`FULL_GAME_STALE_SECONDS`; failed jobs retry up to their stored `max_attempts`.
+
+The single-play `/upload` workflow retains its existing background path. The
+durable queue applies to full-game processing only.
 
 ## Upload Flow
 

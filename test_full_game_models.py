@@ -41,7 +41,7 @@ class FullGameModelContractTests(unittest.TestCase):
 
     def test_processing_jobs_track_retry_state(self):
         self.assertTrue({
-            "stage", "attempts", "max_attempts", "available_at",
+            "job_key", "stage", "attempts", "max_attempts", "available_at",
         } <= model_columns("ProcessingJob"))
 
 
