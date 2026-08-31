@@ -11,7 +11,7 @@ import secrets
 import time
 from datetime import datetime, timezone
 from typing import List, Optional
-from models import Game, Upload, Rule
+from models import Game, Play, PlayFinding, ProcessingJob, Upload, Rule
 from coaches_film_detector import detect_play_boundaries, extract_activity_samples
 
 import boto3
@@ -53,6 +53,9 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_EMBED_MODEL = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-large")  # 3072-D
 CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.60"))
+PLAY_DETECTOR_MODE = os.getenv("PLAY_DETECTOR_MODE", "coaches_activity_with_fallback")
+LEGACY_GAME_SEGMENT_SECONDS = float(os.getenv("LEGACY_GAME_SEGMENT_SECONDS", "35"))
+LEGACY_GAME_SEGMENT_GAP_SECONDS = float(os.getenv("LEGACY_GAME_SEGMENT_GAP_SECONDS", "5"))
 DAVE_API_KEY = os.getenv("DAVE_API_KEY")
 CORS_ALLOWED_ORIGINS = _parse_cors_origins(os.getenv("CORS_ALLOWED_ORIGINS"))
 
@@ -128,6 +131,114 @@ def ensure_ruleset_columns():
         conn.execute(sqltext("ALTER TABLE IF EXISTS uploads ADD COLUMN IF NOT EXISTS clip_s3_url TEXT"))
         conn.execute(sqltext("ALTER TABLE IF EXISTS uploads ADD COLUMN IF NOT EXISTS result TEXT"))
         conn.execute(sqltext("ALTER TABLE IF EXISTS rules ADD COLUMN IF NOT EXISTS ruleset TEXT NOT NULL DEFAULT 'high_school'"))
+        conn.execute(sqltext("""
+            CREATE TABLE IF NOT EXISTS plays (
+                id BIGSERIAL PRIMARY KEY,
+                game_id BIGINT NOT NULL,
+                legacy_upload_id BIGINT UNIQUE,
+                play_number INTEGER NOT NULL,
+                source_start_time DOUBLE PRECISION NOT NULL,
+                source_end_time DOUBLE PRECISION NOT NULL,
+                clip_start_time DOUBLE PRECISION,
+                clip_end_time DOUBLE PRECISION,
+                clip_s3_url TEXT,
+                detection_method TEXT DEFAULT 'coaches_activity',
+                detection_confidence DOUBLE PRECISION,
+                boundary_review_status TEXT DEFAULT 'unreviewed',
+                analysis_status TEXT DEFAULT 'pending',
+                analysis_version TEXT,
+                result TEXT,
+                prediction_label TEXT,
+                confidence DOUBLE PRECISION,
+                notes TEXT,
+                error_message TEXT,
+                created_at TIMESTAMP,
+                updated_at TIMESTAMP,
+                analyzed_at TIMESTAMP
+            )
+        """))
+        conn.execute(sqltext("CREATE INDEX IF NOT EXISTS ix_plays_game_id ON plays (game_id)"))
+        conn.execute(sqltext("CREATE UNIQUE INDEX IF NOT EXISTS ix_plays_legacy_upload_id ON plays (legacy_upload_id)"))
+        conn.execute(sqltext("""
+            INSERT INTO plays (
+                game_id, legacy_upload_id, play_number,
+                source_start_time, source_end_time, clip_start_time, clip_end_time,
+                clip_s3_url, detection_method, detection_confidence,
+                boundary_review_status, analysis_status, result,
+                prediction_label, confidence, notes, error_message,
+                created_at, updated_at, analyzed_at
+            )
+            SELECT
+                game_id, id, COALESCE(play_number, 0),
+                COALESCE(start_time, 0), COALESCE(end_time, 0), start_time, end_time,
+                clip_s3_url, 'legacy_upload', segment_confidence,
+                'unreviewed', COALESCE(status, 'pending'), result,
+                prediction_label, confidence, notes, error_message,
+                timestamp, COALESCE(processed_at, timestamp), processed_at
+            FROM uploads
+            WHERE game_id IS NOT NULL
+            ON CONFLICT (legacy_upload_id) DO NOTHING
+        """))
+        conn.execute(sqltext("""
+            CREATE TABLE IF NOT EXISTS play_findings (
+                id BIGSERIAL PRIMARY KEY,
+                play_id BIGINT NOT NULL,
+                disposition TEXT NOT NULL,
+                foul_label TEXT,
+                committing_team TEXT,
+                player_number TEXT,
+                event_time DOUBLE PRECISION,
+                confidence DOUBLE PRECISION,
+                evidence_summary TEXT,
+                reasoning TEXT,
+                rule_citations JSONB,
+                uncertainty_notes TEXT,
+                review_status TEXT DEFAULT 'unreviewed',
+                human_label TEXT,
+                human_notes TEXT,
+                created_at TIMESTAMP,
+                updated_at TIMESTAMP
+            )
+        """))
+        conn.execute(sqltext("CREATE INDEX IF NOT EXISTS ix_play_findings_play_id ON play_findings (play_id)"))
+        conn.execute(sqltext("""
+            INSERT INTO play_findings (
+                play_id, disposition, foul_label, confidence, reasoning,
+                rule_citations, review_status, human_label, human_notes,
+                created_at, updated_at
+            )
+            SELECT
+                p.id, COALESCE(u.result, 'UNCERTAIN'), u.prediction_label,
+                u.confidence, u.explanation, '[]'::jsonb, 'unreviewed',
+                u.human_label, u.human_notes,
+                COALESCE(u.processed_at, u.timestamp), COALESCE(u.processed_at, u.timestamp)
+            FROM uploads u
+            JOIN plays p ON p.legacy_upload_id = u.id
+            WHERE u.game_id IS NOT NULL
+              AND u.result IN ('FOUL', 'UNCERTAIN')
+              AND NOT EXISTS (
+                  SELECT 1 FROM play_findings pf WHERE pf.play_id = p.id
+              )
+        """))
+        conn.execute(sqltext("""
+            CREATE TABLE IF NOT EXISTS processing_jobs (
+                id BIGSERIAL PRIMARY KEY,
+                game_id BIGINT NOT NULL,
+                play_id BIGINT,
+                stage TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'queued',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                max_attempts INTEGER NOT NULL DEFAULT 3,
+                error_message TEXT,
+                available_at TIMESTAMP,
+                started_at TIMESTAMP,
+                finished_at TIMESTAMP,
+                created_at TIMESTAMP,
+                updated_at TIMESTAMP
+            )
+        """))
+        conn.execute(sqltext("CREATE INDEX IF NOT EXISTS ix_processing_jobs_game_id ON processing_jobs (game_id)"))
+        conn.execute(sqltext("CREATE INDEX IF NOT EXISTS ix_processing_jobs_play_id ON processing_jobs (play_id)"))
 
 # Dependency to get the database session
 async def get_db():
@@ -342,8 +453,38 @@ def _detect_play_segments(video_bytes: bytes) -> List[dict]:
     duration = _probe_video_duration(video_bytes)
     if duration <= 0:
         return []
-    samples = extract_activity_samples(video_bytes)
-    return detect_play_boundaries(samples, duration)
+    if PLAY_DETECTOR_MODE == "fixed_window":
+        return _detect_play_segments_fixed_window(duration)
+    try:
+        samples = extract_activity_samples(video_bytes)
+        segments = detect_play_boundaries(samples, duration)
+    except Exception:
+        if PLAY_DETECTOR_MODE != "coaches_activity_with_fallback":
+            raise
+        segments = []
+    if segments or PLAY_DETECTOR_MODE != "coaches_activity_with_fallback":
+        return segments
+    return _detect_play_segments_fixed_window(duration)
+
+
+def _detect_play_segments_fixed_window(duration: float) -> List[dict]:
+    """Temporary legacy fallback retained until play detection is validated."""
+    segment_seconds = max(8.0, LEGACY_GAME_SEGMENT_SECONDS)
+    gap_seconds = max(0.0, LEGACY_GAME_SEGMENT_GAP_SECONDS)
+    step = segment_seconds + gap_seconds
+    segments: List[dict] = []
+    start = 0.0
+    while start < duration:
+        end = min(duration, start + segment_seconds)
+        if end - start >= 4.0:
+            segments.append({
+                "play_number": len(segments) + 1,
+                "start_time": round(start, 2),
+                "end_time": round(end, 2),
+                "segment_confidence": 0.35,
+            })
+        start += step
+    return segments
 
 def _extract_clip_bytes(video_bytes: bytes, start_time: float, end_time: float) -> bytes:
     start_time = max(0.0, float(start_time))
@@ -812,6 +953,17 @@ async def _segment_game_bg(game_id: int):
             game.status = "segmenting"
             game.progress = 0.05
             game.error_message = None
+            job_result = await db.execute(
+                select(ProcessingJob)
+                .where(ProcessingJob.game_id == game_id, ProcessingJob.stage == "detect_plays")
+                .order_by(ProcessingJob.id.desc())
+            )
+            job = job_result.scalars().first()
+            if job:
+                job.status = "running"
+                job.attempts = int(job.attempts or 0) + 1
+                job.started_at = _now_utc()
+                job.updated_at = _now_utc()
             await db.commit()
 
             key = _s3_key_from_url(game.s3_url)
@@ -823,7 +975,7 @@ async def _segment_game_bg(game_id: int):
                 raise RuntimeError("No playable segments could be detected in the uploaded video.")
 
             for segment in segments:
-                db.add(Upload(
+                upload = Upload(
                     game_id=game.id,
                     play_number=segment["play_number"],
                     start_time=segment["start_time"],
@@ -836,12 +988,38 @@ async def _segment_game_bg(game_id: int):
                     timestamp=_now_utc(),
                     status="segmented",
                     result=None,
+                )
+                db.add(upload)
+                await db.flush()
+                db.add(Play(
+                    game_id=game.id,
+                    legacy_upload_id=upload.id,
+                    play_number=upload.play_number,
+                    source_start_time=upload.start_time,
+                    source_end_time=upload.end_time,
+                    clip_start_time=upload.start_time,
+                    clip_end_time=upload.end_time,
+                    detection_method=(
+                        "legacy_fixed_window"
+                        if upload.segment_confidence == 0.35
+                        else "coaches_activity"
+                    ),
+                    detection_confidence=upload.segment_confidence,
+                    boundary_review_status="unreviewed",
+                    analysis_status="segmented",
+                    notes="",
+                    created_at=_now_utc(),
+                    updated_at=_now_utc(),
                 ))
 
             game.status = "segments_ready"
             game.progress = 0.25
             game.segment_count = len(segments)
             game.segmented_at = _now_utc()
+            if job:
+                job.status = "completed"
+                job.finished_at = _now_utc()
+                job.updated_at = _now_utc()
             await db.commit()
         except Exception as e:
             result = await db.execute(select(Game).where(Game.id == game_id))
@@ -849,6 +1027,17 @@ async def _segment_game_bg(game_id: int):
             if game:
                 game.status = "error"
                 game.error_message = _safe_err_text(e)
+                job_result = await db.execute(
+                    select(ProcessingJob)
+                    .where(ProcessingJob.game_id == game_id, ProcessingJob.stage == "detect_plays")
+                    .order_by(ProcessingJob.id.desc())
+                )
+                job = job_result.scalars().first()
+                if job:
+                    job.status = "failed"
+                    job.error_message = _safe_err_text(e)
+                    job.finished_at = _now_utc()
+                    job.updated_at = _now_utc()
                 await db.commit()
 
 async def _analyze_game_bg(game_id: int):
@@ -875,6 +1064,17 @@ async def _analyze_game_bg(game_id: int):
             game.progress = 0.30
             game.error_message = None
             game.analyzed_count = 0
+            job_result = await db.execute(
+                select(ProcessingJob)
+                .where(ProcessingJob.game_id == game_id, ProcessingJob.stage == "analyze_plays")
+                .order_by(ProcessingJob.id.desc())
+            )
+            job = job_result.scalars().first()
+            if job:
+                job.status = "running"
+                job.attempts = int(job.attempts or 0) + 1
+                job.started_at = _now_utc()
+                job.updated_at = _now_utc()
             await db.commit()
 
             key = _s3_key_from_url(game.s3_url)
@@ -886,6 +1086,14 @@ async def _analyze_game_bg(game_id: int):
             for index, play in enumerate(plays, start=1):
                 play.status = "processing"
                 play.error_message = None
+                timeline_result = await db.execute(
+                    select(Play).where(Play.legacy_upload_id == play.id)
+                )
+                timeline_play = timeline_result.scalar_one_or_none()
+                if timeline_play:
+                    timeline_play.analysis_status = "processing"
+                    timeline_play.error_message = None
+                    timeline_play.updated_at = _now_utc()
                 await db.commit()
 
                 try:
@@ -937,10 +1145,42 @@ async def _analyze_game_bg(game_id: int):
                     play.retrieved_rules = retrieved
                     play.processed_at = _now_utc()
                     play.error_message = None
+
+                    if timeline_play:
+                        timeline_play.clip_s3_url = clip_s3_url
+                        timeline_play.analysis_status = "done"
+                        timeline_play.analysis_version = "legacy-single-finding-v1"
+                        timeline_play.result = prediction["result"]
+                        timeline_play.prediction_label = label
+                        timeline_play.confidence = prediction["confidence"]
+                        timeline_play.error_message = None
+                        timeline_play.updated_at = _now_utc()
+                        timeline_play.analyzed_at = _now_utc()
+                        await db.execute(
+                            delete(PlayFinding).where(PlayFinding.play_id == timeline_play.id)
+                        )
+                        if prediction["result"] != "NO FOUL":
+                            db.add(PlayFinding(
+                                play_id=timeline_play.id,
+                                disposition=prediction["result"],
+                                foul_label=label,
+                                confidence=prediction["confidence"],
+                                evidence_summary=prediction["evidence_summary"],
+                                reasoning=prediction["why_foul_or_no_foul"],
+                                rule_citations=prediction["rule_citations"],
+                                uncertainty_notes=prediction["uncertainty_notes"],
+                                review_status="unreviewed",
+                                created_at=_now_utc(),
+                                updated_at=_now_utc(),
+                            ))
                 except Exception as play_error:
                     play.status = "error"
                     play.error_message = _safe_err_text(play_error)
                     play.processed_at = _now_utc()
+                    if timeline_play:
+                        timeline_play.analysis_status = "error"
+                        timeline_play.error_message = _safe_err_text(play_error)
+                        timeline_play.updated_at = _now_utc()
                     failed_count += 1
 
                 game.analyzed_count = index
@@ -955,6 +1195,11 @@ async def _analyze_game_bg(game_id: int):
                 if failed_count == 0
                 else f"{failed_count} of {total} play analyses failed."
             )
+            if job:
+                job.status = "completed" if failed_count == 0 else "failed"
+                job.error_message = game.error_message
+                job.finished_at = _now_utc()
+                job.updated_at = _now_utc()
             await db.commit()
         except Exception as e:
             result = await db.execute(select(Game).where(Game.id == game_id))
@@ -962,6 +1207,17 @@ async def _analyze_game_bg(game_id: int):
             if game:
                 game.status = "error"
                 game.error_message = _safe_err_text(e)
+                job_result = await db.execute(
+                    select(ProcessingJob)
+                    .where(ProcessingJob.game_id == game_id, ProcessingJob.stage == "analyze_plays")
+                    .order_by(ProcessingJob.id.desc())
+                )
+                job = job_result.scalars().first()
+                if job:
+                    job.status = "failed"
+                    job.error_message = _safe_err_text(e)
+                    job.finished_at = _now_utc()
+                    job.updated_at = _now_utc()
                 await db.commit()
 
 # ------------------------------------------------------------------------------
@@ -1006,6 +1262,17 @@ async def upload_game_video(
         db.add(rec)
         await db.commit()
         await db.refresh(rec)
+        db.add(ProcessingJob(
+            game_id=rec.id,
+            stage="detect_plays",
+            status="queued",
+            attempts=0,
+            max_attempts=3,
+            available_at=_now_utc(),
+            created_at=_now_utc(),
+            updated_at=_now_utc(),
+        ))
+        await db.commit()
         asyncio.create_task(_segment_game_bg(rec.id))
         return GameUploadResponse(id=rec.id, s3_url=s3_url)
     except Exception as e:
@@ -1070,6 +1337,86 @@ async def get_game_plays(
     rows = rows_result.scalars().all()
     return {"items": [_play_to_dict(row) for row in rows], "total": len(rows)}
 
+
+@app.get("/api/games/{game_id}/timeline")
+async def get_game_timeline(
+    game_id: int,
+    db: AsyncSession = Depends(get_db),
+    _auth: None = Depends(require_api_key),
+):
+    game_result = await db.execute(select(Game).where(Game.id == game_id))
+    if not game_result.scalar_one_or_none():
+        raise HTTPException(status_code=404, detail="Game not found")
+    plays_result = await db.execute(
+        select(Play).where(Play.game_id == game_id).order_by(Play.play_number, Play.source_start_time)
+    )
+    plays = plays_result.scalars().all()
+    play_ids = [play.id for play in plays]
+    findings_by_play = {play_id: [] for play_id in play_ids}
+    if play_ids:
+        findings_result = await db.execute(
+            select(PlayFinding).where(PlayFinding.play_id.in_(play_ids)).order_by(PlayFinding.id)
+        )
+        for finding in findings_result.scalars().all():
+            findings_by_play[finding.play_id].append({
+                "id": finding.id,
+                "disposition": finding.disposition,
+                "foul_label": finding.foul_label,
+                "committing_team": finding.committing_team,
+                "player_number": finding.player_number,
+                "event_time": finding.event_time,
+                "confidence": finding.confidence,
+                "evidence_summary": finding.evidence_summary,
+                "reasoning": finding.reasoning,
+                "rule_citations": finding.rule_citations or [],
+                "uncertainty_notes": finding.uncertainty_notes,
+                "review_status": finding.review_status,
+                "human_label": finding.human_label,
+                "human_notes": finding.human_notes,
+            })
+    jobs_result = await db.execute(
+        select(ProcessingJob)
+        .where(ProcessingJob.game_id == game_id)
+        .order_by(ProcessingJob.id)
+    )
+    jobs = jobs_result.scalars().all()
+    return {
+        "items": [{
+            "id": play.id,
+            "legacy_upload_id": play.legacy_upload_id,
+            "play_number": play.play_number,
+            "source_start_time": play.source_start_time,
+            "source_end_time": play.source_end_time,
+            "clip_start_time": play.clip_start_time,
+            "clip_end_time": play.clip_end_time,
+            "clip_s3_url": play.clip_s3_url,
+            "detection_method": play.detection_method,
+            "detection_confidence": play.detection_confidence,
+            "boundary_review_status": play.boundary_review_status,
+            "analysis_status": play.analysis_status,
+            "analysis_version": play.analysis_version,
+            "result": play.result,
+            "prediction_label": play.prediction_label,
+            "confidence": play.confidence,
+            "notes": play.notes,
+            "error_message": play.error_message,
+            "findings": findings_by_play[play.id],
+        } for play in plays],
+        "total": len(plays),
+        "jobs": [{
+            "id": job.id,
+            "play_id": job.play_id,
+            "stage": job.stage,
+            "status": job.status,
+            "attempts": job.attempts,
+            "max_attempts": job.max_attempts,
+            "error_message": job.error_message,
+            "available_at": job.available_at.isoformat() if job.available_at else None,
+            "started_at": job.started_at.isoformat() if job.started_at else None,
+            "finished_at": job.finished_at.isoformat() if job.finished_at else None,
+        } for job in jobs],
+    }
+
 @app.patch("/api/games/{game_id}/segments")
 async def update_game_segments(
     game_id: int,
@@ -1084,12 +1431,17 @@ async def update_game_segments(
     if game.status == "analyzing":
         raise HTTPException(status_code=409, detail="Cannot edit segments while analysis is running")
 
-    await db.execute(delete(Upload).where(Upload.game_id == game_id))
     clean_segments = sorted(payload.segments, key=lambda item: (item.start_time, item.end_time))
+    existing_plays_result = await db.execute(select(Play.id).where(Play.game_id == game_id))
+    existing_play_ids = list(existing_plays_result.scalars().all())
+    if existing_play_ids:
+        await db.execute(delete(PlayFinding).where(PlayFinding.play_id.in_(existing_play_ids)))
+    await db.execute(delete(Play).where(Play.game_id == game_id))
+    await db.execute(delete(Upload).where(Upload.game_id == game_id))
     for index, segment in enumerate(clean_segments, start=1):
         if segment.end_time <= segment.start_time:
             raise HTTPException(status_code=400, detail="Each segment end_time must be after start_time")
-        db.add(Upload(
+        upload = Upload(
             game_id=game.id,
             play_number=segment.play_number or index,
             start_time=segment.start_time,
@@ -1101,12 +1453,40 @@ async def update_game_segments(
             ruleset=game.ruleset,
             timestamp=_now_utc(),
             status="segmented",
+        )
+        db.add(upload)
+        await db.flush()
+        db.add(Play(
+            game_id=game.id,
+            legacy_upload_id=upload.id,
+            play_number=upload.play_number,
+            source_start_time=upload.start_time,
+            source_end_time=upload.end_time,
+            clip_start_time=upload.start_time,
+            clip_end_time=upload.end_time,
+            detection_method="human_edited",
+            detection_confidence=1.0,
+            boundary_review_status="approved",
+            analysis_status="segmented",
+            notes=upload.notes,
+            created_at=_now_utc(),
+            updated_at=_now_utc(),
         ))
     game.segment_count = len(clean_segments)
     game.analyzed_count = 0
     game.status = "segments_ready"
     game.progress = 0.25
     game.error_message = None
+    db.add(ProcessingJob(
+        game_id=game_id,
+        stage="analyze_plays",
+        status="queued",
+        attempts=0,
+        max_attempts=3,
+        available_at=_now_utc(),
+        created_at=_now_utc(),
+        updated_at=_now_utc(),
+    ))
     await db.commit()
     return {"ok": True, "segment_count": len(clean_segments)}
 

@@ -68,3 +68,70 @@ class Game(Base):
     created_at = Column(DateTime)
     segmented_at = Column(DateTime)
     analyzed_at = Column(DateTime)
+
+
+class Play(Base):
+    __tablename__ = "plays"
+
+    id = Column(BigInteger, primary_key=True)
+    game_id = Column(BigInteger, nullable=False, index=True)
+    legacy_upload_id = Column(BigInteger, unique=True, index=True)
+    play_number = Column(Integer, nullable=False)
+    source_start_time = Column(Float, nullable=False)
+    source_end_time = Column(Float, nullable=False)
+    clip_start_time = Column(Float)
+    clip_end_time = Column(Float)
+    clip_s3_url = Column(Text)
+    detection_method = Column(Text, default="coaches_activity")
+    detection_confidence = Column(Float)
+    boundary_review_status = Column(Text, default="unreviewed")
+    analysis_status = Column(Text, default="pending")
+    analysis_version = Column(Text)
+    result = Column(Text)
+    prediction_label = Column(Text)
+    confidence = Column(Float)
+    notes = Column(Text)
+    error_message = Column(Text)
+    created_at = Column(DateTime)
+    updated_at = Column(DateTime)
+    analyzed_at = Column(DateTime)
+
+
+class PlayFinding(Base):
+    __tablename__ = "play_findings"
+
+    id = Column(BigInteger, primary_key=True)
+    play_id = Column(BigInteger, nullable=False, index=True)
+    disposition = Column(Text, nullable=False)
+    foul_label = Column(Text)
+    committing_team = Column(Text)
+    player_number = Column(Text)
+    event_time = Column(Float)
+    confidence = Column(Float)
+    evidence_summary = Column(Text)
+    reasoning = Column(Text)
+    rule_citations = Column(JSONB)
+    uncertainty_notes = Column(Text)
+    review_status = Column(Text, default="unreviewed")
+    human_label = Column(Text)
+    human_notes = Column(Text)
+    created_at = Column(DateTime)
+    updated_at = Column(DateTime)
+
+
+class ProcessingJob(Base):
+    __tablename__ = "processing_jobs"
+
+    id = Column(BigInteger, primary_key=True)
+    game_id = Column(BigInteger, nullable=False, index=True)
+    play_id = Column(BigInteger, index=True)
+    stage = Column(Text, nullable=False)
+    status = Column(Text, nullable=False, default="queued")
+    attempts = Column(Integer, nullable=False, default=0)
+    max_attempts = Column(Integer, nullable=False, default=3)
+    error_message = Column(Text)
+    available_at = Column(DateTime)
+    started_at = Column(DateTime)
+    finished_at = Column(DateTime)
+    created_at = Column(DateTime)
+    updated_at = Column(DateTime)
