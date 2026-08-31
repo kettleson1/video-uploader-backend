@@ -37,6 +37,7 @@ class FullGameModelContractTests(unittest.TestCase):
     def test_findings_support_multiple_rulings_per_play(self):
         self.assertTrue({
             "play_id", "foul_label", "rule_citations", "review_status",
+            "human_disposition", "human_committing_team", "reviewed_at", "created_by",
         } <= model_columns("PlayFinding"))
 
     def test_processing_jobs_track_retry_state(self):

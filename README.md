@@ -152,6 +152,13 @@ http://localhost:8000/api/docs
 | `/api/review/{upload_id}` | POST | Save human review and optional prediction override |
 | `/api/plays/{upload_id}/review` | PATCH | Save or clear human review data |
 | `/api/games/{game_id}/timeline` | GET | Return migrated plays, findings, and processing-job state for a full game |
+| `/api/play-findings/{finding_id}/review` | PATCH | Agree with, correct, dismiss, or clear review of one foul finding |
+| `/api/plays/{play_id}/findings` | POST | Add an official finding to a full-game play |
+
+Full-game play analysis may return multiple independent foul or uncertain
+findings. A completed no-foul review is represented by `result: "NO FOUL"` and
+an empty `findings` array. Enforcement, acceptance, declination, offsetting
+administration, and disqualification remain outside the AI finding schema.
 
 ## Full-Game Compatibility Migration
 

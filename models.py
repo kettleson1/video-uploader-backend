@@ -121,7 +121,12 @@ class PlayFinding(Base):
     uncertainty_notes = Column(Text)
     review_status = Column(Text, default="unreviewed")
     human_label = Column(Text)
+    human_disposition = Column(Text)
+    human_committing_team = Column(Text)
+    human_player_number = Column(Text)
     human_notes = Column(Text)
+    reviewed_at = Column(DateTime)
+    created_by = Column(Text, default="ai")
     created_at = Column(DateTime)
     updated_at = Column(DateTime)
 

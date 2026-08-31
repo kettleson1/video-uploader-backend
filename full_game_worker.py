@@ -44,7 +44,7 @@ CLAIM_BATCH_SIZE = max(WORKER_CONCURRENCY, int(os.getenv("FULL_GAME_CLAIM_BATCH_
 POLL_SECONDS = max(0.25, float(os.getenv("FULL_GAME_POLL_SECONDS", "2")))
 STALE_SECONDS = max(60, int(os.getenv("FULL_GAME_STALE_SECONDS", "900")))
 RETRY_SECONDS = max(1, int(os.getenv("FULL_GAME_RETRY_SECONDS", "15")))
-ANALYSIS_VERSION = "staged-single-finding-v1"
+ANALYSIS_VERSION = "staged-multi-finding-v1"
 
 
 def now_utc():
@@ -69,7 +69,7 @@ async def enqueue_finalize_if_ready(db, game_id: int):
     ).hexdigest()[:16]
     await enqueue_job(
         db,
-        job_key=f"game:{game_id}:finalize:{signature}",
+        job_key=f"game:{game_id}:finalize:multi-v1:{signature}",
         game_id=game_id,
         stage="finalize_game",
     )
@@ -217,7 +217,7 @@ async def handle_extract_clips(job: ProcessingJob):
                 upload.status = "queued"
             await enqueue_job(
                 db,
-                job_key=f"play:{play.id}:screen:v1",
+                job_key=f"play:{play.id}:screen:multi-v1",
                 game_id=game.id,
                 play_id=play.id,
                 stage="screen_play",
@@ -245,7 +245,7 @@ async def handle_screen_play(job: ProcessingJob):
         play.updated_at = now_utc()
         await enqueue_job(
             db,
-            job_key=f"play:{play.id}:retrieve_rules:v1",
+            job_key=f"play:{play.id}:retrieve_rules:multi-v1",
             game_id=game.id,
             play_id=play.id,
             stage="retrieve_rules",
@@ -268,7 +268,7 @@ async def handle_retrieve_rules(job: ProcessingJob):
         play.updated_at = now_utc()
         await enqueue_job(
             db,
-            job_key=f"play:{play.id}:analyze_foul:v1",
+            job_key=f"play:{play.id}:analyze_foul:multi-v1",
             game_id=game.id,
             play_id=play.id,
             stage="analyze_foul",
@@ -282,7 +282,7 @@ async def handle_analyze_foul(job: ProcessingJob):
         game = await db.get(Game, job.game_id)
         if not play or not game or not play.broad_screen:
             raise RuntimeError("Play evidence is unavailable")
-        if not play.analysis_payload:
+        if not play.analysis_payload or "findings" not in play.analysis_payload:
             play.analysis_status = "focused_analysis"
             await db.commit()
             play.analysis_payload = await _predict_batch_with_rules(
@@ -297,7 +297,7 @@ async def handle_analyze_foul(job: ProcessingJob):
         play.updated_at = now_utc()
         await enqueue_job(
             db,
-            job_key=f"play:{play.id}:store_findings:v1",
+            job_key=f"play:{play.id}:store_findings:multi-v1",
             game_id=game.id,
             play_id=play.id,
             stage="store_findings",
@@ -312,16 +312,19 @@ async def handle_store_findings(job: ProcessingJob):
             raise RuntimeError("Focused analysis result is unavailable")
         prediction = play.analysis_payload
         await db.execute(delete(PlayFinding).where(PlayFinding.play_id == play.id))
-        if prediction["result"] != "NO FOUL":
+        for finding in prediction.get("findings") or []:
             db.add(PlayFinding(
                 play_id=play.id,
-                disposition=prediction["result"],
-                foul_label=prediction["label"],
-                confidence=prediction["confidence"],
-                evidence_summary=prediction["evidence_summary"],
-                reasoning=prediction["why_foul_or_no_foul"],
-                rule_citations=prediction["rule_citations"],
-                uncertainty_notes=prediction["uncertainty_notes"],
+                disposition=finding["disposition"],
+                foul_label=finding["foul_label"],
+                committing_team=finding["committing_team"],
+                player_number=finding["player_number"],
+                event_time=finding["event_time"],
+                confidence=finding["confidence"],
+                evidence_summary=finding["evidence_summary"],
+                reasoning=finding["reasoning"],
+                rule_citations=finding["rule_citations"],
+                uncertainty_notes=finding["uncertainty_notes"],
                 review_status="unreviewed",
                 created_at=now_utc(),
                 updated_at=now_utc(),
@@ -344,6 +347,8 @@ async def handle_store_findings(job: ProcessingJob):
                 "evidence_summary": prediction["evidence_summary"],
                 "why_foul_or_no_foul": prediction["why_foul_or_no_foul"],
                 "uncertainty_notes": prediction["uncertainty_notes"],
+                "no_foul_reason": prediction.get("no_foul_reason", ""),
+                "findings": prediction.get("findings") or [],
             })
             upload.retrieved_rules = play.retrieved_rules
             upload.processed_at = now_utc()

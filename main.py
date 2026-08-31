@@ -18,11 +18,12 @@ from coaches_film_detector import (
     find_uncovered_intervals,
 )
 from job_queue import enqueue_job
+from foul_findings import normalize_findings_payload
 
 import boto3
 from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, Query, Body, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, func, or_
 from sqlalchemy import delete, select
 from sqlalchemy.orm import sessionmaker, Session
@@ -213,11 +214,21 @@ def ensure_ruleset_columns():
                 uncertainty_notes TEXT,
                 review_status TEXT DEFAULT 'unreviewed',
                 human_label TEXT,
+                human_disposition TEXT,
+                human_committing_team TEXT,
+                human_player_number TEXT,
                 human_notes TEXT,
+                reviewed_at TIMESTAMP,
+                created_by TEXT DEFAULT 'ai',
                 created_at TIMESTAMP,
                 updated_at TIMESTAMP
             )
         """))
+        conn.execute(sqltext("ALTER TABLE IF EXISTS play_findings ADD COLUMN IF NOT EXISTS human_disposition TEXT"))
+        conn.execute(sqltext("ALTER TABLE IF EXISTS play_findings ADD COLUMN IF NOT EXISTS human_committing_team TEXT"))
+        conn.execute(sqltext("ALTER TABLE IF EXISTS play_findings ADD COLUMN IF NOT EXISTS human_player_number TEXT"))
+        conn.execute(sqltext("ALTER TABLE IF EXISTS play_findings ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMP"))
+        conn.execute(sqltext("ALTER TABLE IF EXISTS play_findings ADD COLUMN IF NOT EXISTS created_by TEXT DEFAULT 'ai'"))
         conn.execute(sqltext("CREATE INDEX IF NOT EXISTS ix_play_findings_play_id ON play_findings (play_id)"))
         conn.execute(sqltext("""
             INSERT INTO play_findings (
@@ -349,6 +360,26 @@ class OfficialFeedbackIn(BaseModel):
     human_label: Optional[str] = None
     human_notes: Optional[str] = None
 
+class FindingReviewPayload(BaseModel):
+    review_status: str
+    human_disposition: Optional[str] = None
+    human_label: Optional[str] = None
+    human_committing_team: Optional[str] = None
+    human_player_number: Optional[str] = None
+    human_notes: Optional[str] = None
+
+class ManualFindingPayload(BaseModel):
+    disposition: str
+    foul_label: str
+    committing_team: Optional[str] = "unknown"
+    player_number: Optional[str] = None
+    event_time: Optional[float] = None
+    confidence: float = 1.0
+    evidence_summary: Optional[str] = None
+    reasoning: Optional[str] = None
+    rule_citations: List[str] = Field(default_factory=list)
+    uncertainty_notes: Optional[str] = None
+
 # ------------------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------------------
@@ -373,6 +404,30 @@ def _safe_err_text(e: Exception) -> str:
         return str(e)
     except Exception:
         return "Unknown error"
+
+def _finding_to_dict(finding: PlayFinding) -> dict:
+    return {
+        "id": finding.id,
+        "play_id": finding.play_id,
+        "disposition": finding.disposition,
+        "foul_label": finding.foul_label,
+        "committing_team": finding.committing_team,
+        "player_number": finding.player_number,
+        "event_time": finding.event_time,
+        "confidence": finding.confidence,
+        "evidence_summary": finding.evidence_summary,
+        "reasoning": finding.reasoning,
+        "rule_citations": finding.rule_citations or [],
+        "uncertainty_notes": finding.uncertainty_notes,
+        "review_status": finding.review_status,
+        "human_disposition": finding.human_disposition,
+        "human_label": finding.human_label,
+        "human_committing_team": finding.human_committing_team,
+        "human_player_number": finding.human_player_number,
+        "human_notes": finding.human_notes,
+        "reviewed_at": finding.reviewed_at.isoformat() if finding.reviewed_at else None,
+        "created_by": finding.created_by or "ai",
+    }
 
 def _s3_key_from_url(url: str) -> str:
     # https://bucket.s3.region.amazonaws.com/<key>
@@ -750,23 +805,27 @@ async def _predict_batch_with_rules(
 
     sys_prompt = (
         f"You are a {rules_context['label']} officiating review assistant. "
-        "You are not making an official ruling. Decide whether the visible evidence supports "
-        "FOUL, NO FOUL, or UNCERTAIN. Only classify a foul when the visible evidence and "
-        "rule snippets support the required elements."
+        "You are not making an official ruling. Identify every independently supported foul "
+        "or uncertain foul candidate visible on the play. Do not decide enforcement, acceptance, "
+        "declination, offsetting administration, or disqualification. Only classify a foul when "
+        "the visible evidence and rule snippets support its required elements."
     )
     user_prompt = (
         f"PLAY SUMMARY:\n{summary}\n"
         f"{time_text}\n"
         f"OFFICIAL/USER NOTES:\n{notes or 'none'}\n\n"
         f"CANDIDATE RULE SNIPPETS:\n{rules_snips}\n\n"
-        "Respond as JSON with exactly these keys:\n"
-        "- result: FOUL, NO FOUL, or UNCERTAIN\n"
-        "- label: foul label, None for no foul, or Uncertain\n"
-        "- confidence: number from 0 to 1\n"
-        "- rule_citations: array of rule titles or sections used\n"
-        "- evidence_summary: concise visible evidence\n"
-        "- why_foul_or_no_foul: rule-grounded reasoning\n"
-        "- uncertainty_notes: what is unclear or missing"
+        "Respond as JSON with exactly these top-level keys:\n"
+        "- confidence: confidence that the play review is complete, 0 to 1\n"
+        "- play_summary: concise visible evidence for the entire play\n"
+        "- no_foul_reason: why no foul is supported; use an empty string when findings exist\n"
+        "- uncertainty_notes: important missing angles or timing evidence\n"
+        "- findings: an array with zero or more independent findings\n\n"
+        "Each finding must contain: disposition (FOUL or UNCERTAIN), foul_label, "
+        "committing_team (offense, defense, kicking, receiving, or unknown), player_number "
+        "(string or null), event_time (seconds from the start of this play clip or null), "
+        "confidence, evidence_summary, reasoning, rule_citations (array), and uncertainty_notes.\n"
+        "Never put NO FOUL in findings. Return an empty findings array when no foul candidate is supported."
     )
 
     chat = await client.chat.completions.create(
@@ -776,7 +835,7 @@ async def _predict_batch_with_rules(
             {"role": "user", "content": user_prompt},
         ],
         temperature=0.1,
-        max_tokens=420,
+        max_tokens=1000,
         response_format={"type": "json_object"},
     )
     txt = (chat.choices[0].message.content or "").strip()
@@ -789,6 +848,15 @@ async def _predict_batch_with_rules(
         "evidence_summary": summary,
         "why_foul_or_no_foul": "The model did not return a usable structured result.",
         "uncertainty_notes": txt[:300],
+        "findings": [{
+            "disposition": "UNCERTAIN",
+            "foul_label": "Uncertain",
+            "confidence": 0.0,
+            "evidence_summary": summary,
+            "reasoning": "The model did not return a usable structured result.",
+            "rule_citations": [],
+            "uncertainty_notes": txt[:300],
+        }],
     }
     try:
         if txt.startswith("```"):
@@ -797,37 +865,15 @@ async def _predict_batch_with_rules(
             txt = "\n".join(txt.splitlines()[:-1])
         data = json.loads(txt)
     except Exception:
-        return fallback
+        return normalize_findings_payload(
+            fallback, summary, CONFIDENCE_THRESHOLD,
+            (end_time - start_time) if start_time is not None and end_time is not None else None,
+        )
 
-    result = str(data.get("result", "UNCERTAIN")).strip().upper()
-    if result not in {"FOUL", "NO FOUL", "UNCERTAIN"}:
-        result = "UNCERTAIN"
-    confidence = _coerce_confidence(data.get("confidence"), 0.0)
-    if confidence < CONFIDENCE_THRESHOLD and result == "FOUL":
-        result = "UNCERTAIN"
-
-    if result == "NO FOUL":
-        label = "None"
-    elif result == "UNCERTAIN":
-        label = "Uncertain"
-    else:
-        label = str(data.get("label") or "Uncertain").strip()
-        if label.lower() in {"", "none", "no foul", "uncertain"}:
-            result = "UNCERTAIN"
-            label = "Uncertain"
-    citations = data.get("rule_citations") or []
-    if not isinstance(citations, list):
-        citations = [str(citations)]
-
-    return {
-        "result": result,
-        "label": label,
-        "confidence": confidence,
-        "rule_citations": [str(item) for item in citations],
-        "evidence_summary": str(data.get("evidence_summary") or summary).strip(),
-        "why_foul_or_no_foul": str(data.get("why_foul_or_no_foul") or "").strip(),
-        "uncertainty_notes": str(data.get("uncertainty_notes") or "").strip(),
-    }
+    return normalize_findings_payload(
+        data, summary, CONFIDENCE_THRESHOLD,
+        (end_time - start_time) if start_time is not None and end_time is not None else None,
+    )
 # ------------------------------------------------------------------------------
 # Background worker (async version)
 # ------------------------------------------------------------------------------
@@ -930,7 +976,11 @@ def _game_to_dict(game: Game) -> dict:
         "analyzed_at": game.analyzed_at.isoformat() if game.analyzed_at else None,
     }
 
-def _play_to_dict(play: Upload, timeline_play: Optional[Play] = None) -> dict:
+def _play_to_dict(
+    play: Upload,
+    timeline_play: Optional[Play] = None,
+    findings: Optional[List[PlayFinding]] = None,
+) -> dict:
     video_url = play.clip_s3_url or play.s3_url
     key = _s3_key_from_url(video_url) if video_url else ""
     presigned = _presign(key, 3600) if key else None
@@ -944,6 +994,7 @@ def _play_to_dict(play: Upload, timeline_play: Optional[Play] = None) -> dict:
         "start_time": play.start_time,
         "end_time": play.end_time,
         "segment_confidence": play.segment_confidence,
+        "timeline_play_id": timeline_play.id if timeline_play else None,
         "detection_method": timeline_play.detection_method if timeline_play else None,
         "boundary_flags": (timeline_play.boundary_flags or []) if timeline_play else [],
         "snap_time": timeline_play.snap_time if timeline_play else None,
@@ -967,6 +1018,7 @@ def _play_to_dict(play: Upload, timeline_play: Optional[Play] = None) -> dict:
         "s3_url": play.s3_url,
         "clip_s3_url": play.clip_s3_url,
         "presigned_url": presigned,
+        "findings": [_finding_to_dict(finding) for finding in (findings or [])],
     }
 
 async def _segment_game_bg(game_id: int):
@@ -1363,6 +1415,7 @@ async def get_game_plays(
     rows = rows_result.scalars().all()
     upload_ids = [row.id for row in rows]
     timeline_by_upload = {}
+    findings_by_play = {}
     if upload_ids:
         timeline_result = await db.execute(
             select(Play).where(Play.legacy_upload_id.in_(upload_ids))
@@ -1370,8 +1423,25 @@ async def get_game_plays(
         timeline_by_upload = {
             play.legacy_upload_id: play for play in timeline_result.scalars().all()
         }
+        timeline_ids = [play.id for play in timeline_by_upload.values()]
+        if timeline_ids:
+            findings_result = await db.execute(
+                select(PlayFinding)
+                .where(PlayFinding.play_id.in_(timeline_ids))
+                .order_by(PlayFinding.id)
+            )
+            for finding in findings_result.scalars().all():
+                findings_by_play.setdefault(finding.play_id, []).append(finding)
     return {
-        "items": [_play_to_dict(row, timeline_by_upload.get(row.id)) for row in rows],
+        "items": [
+            _play_to_dict(
+                row,
+                timeline_by_upload.get(row.id),
+                findings_by_play.get(timeline_by_upload[row.id].id, [])
+                if row.id in timeline_by_upload else [],
+            )
+            for row in rows
+        ],
         "total": len(rows),
     }
 
@@ -1397,22 +1467,7 @@ async def get_game_timeline(
             select(PlayFinding).where(PlayFinding.play_id.in_(play_ids)).order_by(PlayFinding.id)
         )
         for finding in findings_result.scalars().all():
-            findings_by_play[finding.play_id].append({
-                "id": finding.id,
-                "disposition": finding.disposition,
-                "foul_label": finding.foul_label,
-                "committing_team": finding.committing_team,
-                "player_number": finding.player_number,
-                "event_time": finding.event_time,
-                "confidence": finding.confidence,
-                "evidence_summary": finding.evidence_summary,
-                "reasoning": finding.reasoning,
-                "rule_citations": finding.rule_citations or [],
-                "uncertainty_notes": finding.uncertainty_notes,
-                "review_status": finding.review_status,
-                "human_label": finding.human_label,
-                "human_notes": finding.human_notes,
-            })
+            findings_by_play[finding.play_id].append(_finding_to_dict(finding))
     jobs_result = await db.execute(
         select(ProcessingJob)
         .where(ProcessingJob.game_id == game_id)
@@ -1531,6 +1586,129 @@ async def update_game_segments(
     await db.commit()
     return {"ok": True, "segment_count": len(clean_segments)}
 
+
+@app.patch("/api/play-findings/{finding_id}/review")
+async def review_play_finding(
+    finding_id: int,
+    payload: FindingReviewPayload,
+    db: AsyncSession = Depends(get_db),
+    _auth: None = Depends(require_api_key),
+):
+    finding = await db.get(PlayFinding, finding_id)
+    if not finding:
+        raise HTTPException(status_code=404, detail="Finding not found")
+    status = payload.review_status.strip().lower()
+    if status not in {"agreed", "corrected", "dismissed", "unreviewed"}:
+        raise HTTPException(status_code=400, detail="Unsupported finding review status")
+    if status == "unreviewed":
+        finding.review_status = status
+        finding.human_disposition = None
+        finding.human_label = None
+        finding.human_committing_team = None
+        finding.human_player_number = None
+        finding.human_notes = None
+        finding.reviewed_at = None
+    elif status == "dismissed":
+        finding.review_status = status
+        finding.human_disposition = None
+        finding.human_label = None
+        finding.human_committing_team = None
+        finding.human_player_number = None
+        finding.human_notes = payload.human_notes
+        finding.reviewed_at = _now_utc()
+    else:
+        disposition = (
+            finding.disposition if status == "agreed" else
+            str(payload.human_disposition or "").strip().upper()
+        )
+        label = finding.foul_label if status == "agreed" else str(payload.human_label or "").strip()
+        if disposition not in {"FOUL", "UNCERTAIN"}:
+            raise HTTPException(status_code=400, detail="Correction disposition must be FOUL or UNCERTAIN")
+        if disposition == "FOUL" and not label:
+            raise HTTPException(status_code=400, detail="Corrected foul label is required")
+        team = (
+            finding.committing_team if status == "agreed" else
+            str(payload.human_committing_team or "unknown").strip().lower()
+        )
+        if team not in {"offense", "defense", "kicking", "receiving", "unknown"}:
+            raise HTTPException(status_code=400, detail="Unsupported committing team")
+        finding.review_status = status
+        finding.human_disposition = disposition
+        finding.human_label = label or "Uncertain"
+        finding.human_committing_team = team
+        finding.human_player_number = (
+            finding.player_number if status == "agreed" else payload.human_player_number
+        )
+        finding.human_notes = payload.human_notes
+        finding.reviewed_at = _now_utc()
+    finding.updated_at = _now_utc()
+    await db.commit()
+    await db.refresh(finding)
+    return {"ok": True, "finding": _finding_to_dict(finding)}
+
+
+@app.post("/api/plays/{play_id}/findings")
+async def add_manual_play_finding(
+    play_id: int,
+    payload: ManualFindingPayload,
+    db: AsyncSession = Depends(get_db),
+    _auth: None = Depends(require_api_key),
+):
+    play = await db.get(Play, play_id)
+    if not play:
+        raise HTTPException(status_code=404, detail="Play not found")
+    disposition = payload.disposition.strip().upper()
+    if disposition not in {"FOUL", "UNCERTAIN"}:
+        raise HTTPException(status_code=400, detail="Finding disposition must be FOUL or UNCERTAIN")
+    label = payload.foul_label.strip()
+    if not label:
+        raise HTTPException(status_code=400, detail="Foul label is required")
+    team = str(payload.committing_team or "unknown").strip().lower()
+    if team not in {"offense", "defense", "kicking", "receiving", "unknown"}:
+        raise HTTPException(status_code=400, detail="Unsupported committing team")
+    event_time = payload.event_time
+    duration = max(0.0, play.source_end_time - play.source_start_time)
+    if event_time is not None and not 0 <= event_time <= duration:
+        raise HTTPException(status_code=400, detail="Event time must fall within the play clip")
+    finding = PlayFinding(
+        play_id=play.id,
+        disposition=disposition,
+        foul_label=label,
+        committing_team=team,
+        player_number=(payload.player_number or "").strip() or None,
+        event_time=event_time,
+        confidence=max(0.0, min(1.0, payload.confidence)),
+        evidence_summary=payload.evidence_summary or "Added by an official reviewer.",
+        reasoning=payload.reasoning or "Manual official finding.",
+        rule_citations=payload.rule_citations,
+        uncertainty_notes=payload.uncertainty_notes or "",
+        review_status="agreed",
+        human_disposition=disposition,
+        human_label=label,
+        human_committing_team=team,
+        human_player_number=(payload.player_number or "").strip() or None,
+        reviewed_at=_now_utc(),
+        created_by="human",
+        created_at=_now_utc(),
+        updated_at=_now_utc(),
+    )
+    db.add(finding)
+    if disposition == "FOUL" or play.result != "FOUL":
+        play.result = disposition
+        play.prediction_label = label
+        play.confidence = finding.confidence
+        play.updated_at = _now_utc()
+        upload = await db.get(Upload, play.legacy_upload_id)
+        if upload:
+            upload.result = play.result
+            upload.prediction_label = play.prediction_label
+            upload.confidence = play.confidence
+            upload.human_label = label
+            upload.reviewed_at = _now_utc()
+    await db.commit()
+    await db.refresh(finding)
+    return {"ok": True, "finding": _finding_to_dict(finding)}
+
 @app.post("/api/games/{game_id}/analyze")
 async def analyze_game(
     game_id: int,
@@ -1562,7 +1740,7 @@ async def analyze_game(
     game.error_message = None
     await enqueue_job(
         db,
-        job_key=f"game:{game_id}:extract_clips:{segment_signature}",
+        job_key=f"game:{game_id}:extract_clips:multi-v1:{segment_signature}",
         game_id=game_id,
         stage="extract_clips",
     )
