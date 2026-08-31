@@ -12,7 +12,11 @@ import time
 from datetime import datetime, timezone
 from typing import List, Optional
 from models import Game, Play, PlayFinding, ProcessingJob, Upload, Rule
-from coaches_film_detector import detect_play_boundaries, extract_activity_samples
+from coaches_film_detector import (
+    detect_play_boundaries,
+    extract_activity_samples,
+    find_uncovered_intervals,
+)
 
 import boto3
 from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, Query, Body, HTTPException, Depends, Header
@@ -131,6 +135,7 @@ def ensure_ruleset_columns():
         conn.execute(sqltext("ALTER TABLE IF EXISTS uploads ADD COLUMN IF NOT EXISTS clip_s3_url TEXT"))
         conn.execute(sqltext("ALTER TABLE IF EXISTS uploads ADD COLUMN IF NOT EXISTS result TEXT"))
         conn.execute(sqltext("ALTER TABLE IF EXISTS rules ADD COLUMN IF NOT EXISTS ruleset TEXT NOT NULL DEFAULT 'high_school'"))
+        conn.execute(sqltext("ALTER TABLE IF EXISTS games ADD COLUMN IF NOT EXISTS source_duration DOUBLE PRECISION"))
         conn.execute(sqltext("""
             CREATE TABLE IF NOT EXISTS plays (
                 id BIGSERIAL PRIMARY KEY,
@@ -139,11 +144,14 @@ def ensure_ruleset_columns():
                 play_number INTEGER NOT NULL,
                 source_start_time DOUBLE PRECISION NOT NULL,
                 source_end_time DOUBLE PRECISION NOT NULL,
+                snap_time DOUBLE PRECISION,
+                live_ball_end_time DOUBLE PRECISION,
                 clip_start_time DOUBLE PRECISION,
                 clip_end_time DOUBLE PRECISION,
                 clip_s3_url TEXT,
                 detection_method TEXT DEFAULT 'coaches_activity',
                 detection_confidence DOUBLE PRECISION,
+                boundary_flags JSONB,
                 boundary_review_status TEXT DEFAULT 'unreviewed',
                 analysis_status TEXT DEFAULT 'pending',
                 analysis_version TEXT,
@@ -157,6 +165,9 @@ def ensure_ruleset_columns():
                 analyzed_at TIMESTAMP
             )
         """))
+        conn.execute(sqltext("ALTER TABLE IF EXISTS plays ADD COLUMN IF NOT EXISTS snap_time DOUBLE PRECISION"))
+        conn.execute(sqltext("ALTER TABLE IF EXISTS plays ADD COLUMN IF NOT EXISTS live_ball_end_time DOUBLE PRECISION"))
+        conn.execute(sqltext("ALTER TABLE IF EXISTS plays ADD COLUMN IF NOT EXISTS boundary_flags JSONB"))
         conn.execute(sqltext("CREATE INDEX IF NOT EXISTS ix_plays_game_id ON plays (game_id)"))
         conn.execute(sqltext("CREATE UNIQUE INDEX IF NOT EXISTS ix_plays_legacy_upload_id ON plays (legacy_upload_id)"))
         conn.execute(sqltext("""
@@ -907,7 +918,7 @@ def _game_to_dict(game: Game) -> dict:
         "analyzed_at": game.analyzed_at.isoformat() if game.analyzed_at else None,
     }
 
-def _play_to_dict(play: Upload) -> dict:
+def _play_to_dict(play: Upload, timeline_play: Optional[Play] = None) -> dict:
     video_url = play.clip_s3_url or play.s3_url
     key = _s3_key_from_url(video_url) if video_url else ""
     presigned = _presign(key, 3600) if key else None
@@ -921,6 +932,10 @@ def _play_to_dict(play: Upload) -> dict:
         "start_time": play.start_time,
         "end_time": play.end_time,
         "segment_confidence": play.segment_confidence,
+        "detection_method": timeline_play.detection_method if timeline_play else None,
+        "boundary_flags": (timeline_play.boundary_flags or []) if timeline_play else [],
+        "snap_time": timeline_play.snap_time if timeline_play else None,
+        "live_ball_end_time": timeline_play.live_ball_end_time if timeline_play else None,
         "foul_type": play.foul_type,
         "notes": play.notes,
         "ruleset": getattr(play, "ruleset", "high_school"),
@@ -974,6 +989,8 @@ async def _segment_game_bg(game_id: int):
             if not segments:
                 raise RuntimeError("No playable segments could be detected in the uploaded video.")
 
+            game.source_duration = _probe_video_duration(video_bytes)
+
             for segment in segments:
                 upload = Upload(
                     game_id=game.id,
@@ -997,6 +1014,8 @@ async def _segment_game_bg(game_id: int):
                     play_number=upload.play_number,
                     source_start_time=upload.start_time,
                     source_end_time=upload.end_time,
+                    snap_time=segment.get("snap_time"),
+                    live_ball_end_time=segment.get("live_ball_end_time"),
                     clip_start_time=upload.start_time,
                     clip_end_time=upload.end_time,
                     detection_method=(
@@ -1005,6 +1024,7 @@ async def _segment_game_bg(game_id: int):
                         else "coaches_activity"
                     ),
                     detection_confidence=upload.segment_confidence,
+                    boundary_flags=segment.get("boundary_flags") or [],
                     boundary_review_status="unreviewed",
                     analysis_status="segmented",
                     notes="",
@@ -1335,7 +1355,19 @@ async def get_game_plays(
         select(Upload).where(*filters).order_by(Upload.play_number.asc(), Upload.start_time.asc())
     )
     rows = rows_result.scalars().all()
-    return {"items": [_play_to_dict(row) for row in rows], "total": len(rows)}
+    upload_ids = [row.id for row in rows]
+    timeline_by_upload = {}
+    if upload_ids:
+        timeline_result = await db.execute(
+            select(Play).where(Play.legacy_upload_id.in_(upload_ids))
+        )
+        timeline_by_upload = {
+            play.legacy_upload_id: play for play in timeline_result.scalars().all()
+        }
+    return {
+        "items": [_play_to_dict(row, timeline_by_upload.get(row.id)) for row in rows],
+        "total": len(rows),
+    }
 
 
 @app.get("/api/games/{game_id}/timeline")
@@ -1345,7 +1377,8 @@ async def get_game_timeline(
     _auth: None = Depends(require_api_key),
 ):
     game_result = await db.execute(select(Game).where(Game.id == game_id))
-    if not game_result.scalar_one_or_none():
+    game = game_result.scalar_one_or_none()
+    if not game:
         raise HTTPException(status_code=404, detail="Game not found")
     plays_result = await db.execute(
         select(Play).where(Play.game_id == game_id).order_by(Play.play_number, Play.source_start_time)
@@ -1387,11 +1420,14 @@ async def get_game_timeline(
             "play_number": play.play_number,
             "source_start_time": play.source_start_time,
             "source_end_time": play.source_end_time,
+            "snap_time": play.snap_time,
+            "live_ball_end_time": play.live_ball_end_time,
             "clip_start_time": play.clip_start_time,
             "clip_end_time": play.clip_end_time,
             "clip_s3_url": play.clip_s3_url,
             "detection_method": play.detection_method,
             "detection_confidence": play.detection_confidence,
+            "boundary_flags": play.boundary_flags or [],
             "boundary_review_status": play.boundary_review_status,
             "analysis_status": play.analysis_status,
             "analysis_version": play.analysis_version,
@@ -1403,6 +1439,12 @@ async def get_game_timeline(
             "findings": findings_by_play[play.id],
         } for play in plays],
         "total": len(plays),
+        "uncovered_intervals": find_uncovered_intervals(
+            [{"start_time": play.source_start_time, "end_time": play.source_end_time} for play in plays],
+            float(game.source_duration or max(
+                [play.source_end_time for play in plays] or [0.0]
+            )),
+        ),
         "jobs": [{
             "id": job.id,
             "play_id": job.play_id,
@@ -1462,10 +1504,13 @@ async def update_game_segments(
             play_number=upload.play_number,
             source_start_time=upload.start_time,
             source_end_time=upload.end_time,
+            snap_time=None,
+            live_ball_end_time=None,
             clip_start_time=upload.start_time,
             clip_end_time=upload.end_time,
             detection_method="human_edited",
             detection_confidence=1.0,
+            boundary_flags=[],
             boundary_review_status="approved",
             analysis_status="segmented",
             notes=upload.notes,

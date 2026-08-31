@@ -68,6 +68,7 @@ class Game(Base):
     created_at = Column(DateTime)
     segmented_at = Column(DateTime)
     analyzed_at = Column(DateTime)
+    source_duration = Column(Float)
 
 
 class Play(Base):
@@ -79,11 +80,14 @@ class Play(Base):
     play_number = Column(Integer, nullable=False)
     source_start_time = Column(Float, nullable=False)
     source_end_time = Column(Float, nullable=False)
+    snap_time = Column(Float)
+    live_ball_end_time = Column(Float)
     clip_start_time = Column(Float)
     clip_end_time = Column(Float)
     clip_s3_url = Column(Text)
     detection_method = Column(Text, default="coaches_activity")
     detection_confidence = Column(Float)
+    boundary_flags = Column(JSONB)
     boundary_review_status = Column(Text, default="unreviewed")
     analysis_status = Column(Text, default="pending")
     analysis_version = Column(Text)

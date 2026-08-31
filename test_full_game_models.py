@@ -30,7 +30,8 @@ class FullGameModelContractTests(unittest.TestCase):
         self.assertIn("s3_url", model_columns("Game"))
         self.assertTrue({
             "legacy_upload_id", "source_start_time",
-            "detection_confidence", "analysis_status",
+            "detection_confidence", "analysis_status", "snap_time",
+            "live_ball_end_time", "boundary_flags",
         } <= model_columns("Play"))
 
     def test_findings_support_multiple_rulings_per_play(self):
