@@ -1,0 +1,8 @@
+Ruleset: NFL pro football.
+Source basis: 2025 NFL Official Playing Rules, Rule 8, Section 5.
+
+Offensive pass interference occurs when an offensive player more than one yard beyond the line of scrimmage significantly hinders an opponent's ability to defend a forward pass thrown from behind the line. Prohibited acts include blocking downfield before the pass arrives, initiating contact to create separation, pushing off, driving through a defender, or picking/screening a defender in a way that prevents coverage.
+
+Incidental contact, hand fighting without material restriction, contact within one yard of the line, or contact after the pass is touched should not be treated as pass interference.
+
+Video keys: depth beyond the line, timing relative to pass release and arrival, whether contact creates separation, defender's opportunity to play the ball, and whether the ball has been touched.

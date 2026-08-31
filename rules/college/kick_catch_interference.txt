@@ -1,0 +1,8 @@
+Ruleset: NCAA college football.
+Source basis: 2025 NCAA Football Rules and Interpretations, Rule 6, kick-catching interference provisions.
+
+Kick-catching interference occurs when a kicking-team player interferes with a receiving-team player's opportunity to catch a scrimmage kick or free kick. The receiver must be given an unimpeded opportunity to complete the catch before contact, obstruction, or forced movement by an opponent.
+
+Consider whether the receiver signaled, whether the receiver was in position to catch the ball, whether the opponent contacted or obstructed the receiver before the catch or muff, and whether the opponent was blocked into the receiver.
+
+Video keys: receiver's position and focus, ball arrival, contact or obstruction timing, fair-catch signal if any, and whether contact was caused by a block.

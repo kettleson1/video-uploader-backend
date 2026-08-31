@@ -1,0 +1,8 @@
+Ruleset: NCAA college football.
+Source basis: 2025 NCAA Football Rules and Interpretations, Rule 9, Section 1, passer protection rules.
+
+Roughing the passer occurs when a defensive player makes avoidable forcible contact against a passer after it is clear the ball has been thrown, or uses prohibited contact such as forcible contact to the head or neck area, driving the passer into the ground, or attacking at or below the knee area without a legal exception.
+
+A defender is allowed to complete unavoidable contact when committed before the pass is released, but must avoid unnecessary or late force when possible.
+
+Video keys: release timing, defender's steps after release, contact point, body weight or driving action, whether the defender could avoid or reduce contact, and whether the passer remains protected.

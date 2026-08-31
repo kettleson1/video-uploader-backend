@@ -1,0 +1,8 @@
+Ruleset: NCAA college football.
+Source basis: 2025 NCAA Football Rules and Interpretations, Rule 9, Section 1, kicker and holder protection rules.
+
+Roughing the kicker or holder involves forcible contact that endangers the kicker or holder after a scrimmage kick, unless the defender legally touches the kick or is blocked into the kicker. Running into the kicker is less severe contact that displaces or contacts the kicking leg or plant area without the same level of danger.
+
+No foul should be ruled when the defender touches the kick and unavoidable contact follows, or when an opponent's block causes the contact.
+
+Video keys: whether the kick was touched, contact severity, contact point on kicking or plant leg, whether the defender was blocked into the kicker, and whether the kicker had a reasonable chance to regain balance.

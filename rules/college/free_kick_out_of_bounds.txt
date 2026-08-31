@@ -1,0 +1,6 @@
+Ruleset: NCAA college football.
+Source basis: 2025 NCAA Football Rules and Interpretations, Rule 6, free kick rules.
+
+A free kick out of bounds occurs when Team A's free kick goes out of bounds untouched by Team B. If Team B touches the ball before it goes out, the foul does not apply in the same way. The ruling and enforcement depend on kick type, touching, and spot options.
+
+Video keys: whether the play is a free kick, whether Team B touches the ball inbounds, the out-of-bounds spot, whether the ball is possessed before going out, and whether any player is blocked into touching the ball.

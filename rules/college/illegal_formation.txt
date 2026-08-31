@@ -1,0 +1,8 @@
+Ruleset: NCAA college football.
+Source basis: 2025 NCAA Football Rules and Interpretations, Rule 7, Section 1; 2026 formation clarification requires backs to be clearly in the backfield.
+
+Illegal formation occurs when Team A is not legally aligned at the snap. NCAA formation review should verify the required number of players on the line of scrimmage, eligible/ineligible numbering and positioning, whether backs are clearly in the backfield, and whether any player is improperly covered or in no-man's-land.
+
+The 2026 approved clarification emphasizes that backs must be clearly in the backfield; ambiguous depth can create an illegal formation issue when offensive alignment prevents the defense and officials from identifying eligible and ineligible players.
+
+Video keys: freeze the frame at the snap, count line players, identify covered/uncovered receivers, check jersey-number eligibility, confirm backfield depth, and note whether any player is moving or not set.

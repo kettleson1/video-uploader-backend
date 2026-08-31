@@ -1,0 +1,8 @@
+Ruleset: NFL pro football.
+Source basis: 2025 NFL Official Playing Rules, Rule 7, Section 4.
+
+Illegal shift or motion occurs when offensive players fail to meet pre-snap set and motion requirements. After a shift, all offensive players must become set for the required interval before the snap. At the snap, motion must comply with NFL restrictions and may not create illegal forward movement or multiple players moving illegally.
+
+Distinguish a legal single-player motion from a shift involving multiple players. If more than one player is moving at the snap, or the offense never becomes set after a shift, the action is illegal.
+
+Video keys: pre-snap movement, number of players moving at the snap, whether all players pause and become set, motion direction, and snap timing.

@@ -1,0 +1,8 @@
+Ruleset: NCAA college football.
+Source basis: 2025 NCAA Football Rules and Interpretations, Rule 7, Section 3, Article 8; 2026 approved change reduces the offensive pass interference penalty to 10 yards.
+
+Offensive pass interference occurs when an eligible or ineligible Team A player beyond the neutral zone materially interferes with a Team B player's opportunity to defend a legal forward pass before the pass is touched. Common indicators include blocking downfield before the pass is thrown, initiating contact to create separation, pushing off, driving through a defender, or screening a defender without playing the ball.
+
+Actions by Team A behind the neutral zone, incidental contact, mutual hand fighting that does not materially restrict either player, or contact after the pass is touched should not be ruled offensive pass interference.
+
+Video keys: whether the ball crosses the neutral zone, whether Team A contact is more than one yard downfield before the pass is thrown or touched, material advantage gained, and whether the defender was restricted from playing the pass.

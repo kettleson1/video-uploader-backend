@@ -1,0 +1,8 @@
+Ruleset: NCAA college football.
+Source basis: 2025 NCAA Football Rules and Interpretations, Rule 9, Section 3, blocking rules.
+
+An illegal block in the back occurs when a player contacts an opponent from behind and above the waist in a way that pushes or propels the opponent, unless a rule exception applies. The key is initial force from behind, not merely hands appearing on the back after legal side contact.
+
+Do not rule a block in the back when contact is from the side, when the opponent turns late after the blocker has committed, when the contact is incidental and does not affect the play, or when the action is within a legal exception.
+
+Video keys: initial angle of contact, force and displacement, whether the opponent turns, whether the block is above the waist, proximity to the play, and whether the contact materially affects the opponent.

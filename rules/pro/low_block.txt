@@ -1,0 +1,8 @@
+Ruleset: NFL pro football.
+Source basis: 2025 NFL Official Playing Rules, Rule 12, Section 2, Article 4.
+
+NFL low-block rules restrict blocks below the waist based on player position, direction, timing, and play type. A low block is suspect when a player initiates force at or below an opponent's thigh or knee area outside a permitted zone or direction, especially from the side or back or after the play has moved away.
+
+Because NFL low-block restrictions have detailed exceptions, the ruling should identify alignment, ball location, and play phase. If initial positions or contact angle are not visible, mark the ruling uncertain.
+
+Video keys: initial position, offensive or defensive player, contact point, direction of force, play phase, ball location, and whether the block is from front, side, or back.

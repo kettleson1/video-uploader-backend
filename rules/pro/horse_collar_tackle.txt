@@ -1,0 +1,6 @@
+Ruleset: NFL pro football.
+Source basis: 2025 NFL Official Playing Rules, Rule 12, Section 2, Article 16.
+
+A horse-collar tackle occurs when a defender grabs the inside collar of the back or side of the shoulder pads or jersey, or grabs at the nameplate area as covered by rule, and immediately pulls the runner down. The foul is intended to protect against dangerous backward or sideways pull-down tackles.
+
+Video keys: hand location inside collar or nameplate area, immediate pull, runner direction, whether the runner is pulled down by that grip, and whether any exception applies.

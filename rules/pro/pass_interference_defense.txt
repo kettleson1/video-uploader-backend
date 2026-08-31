@@ -1,0 +1,8 @@
+Ruleset: NFL pro football.
+Source basis: 2025 NFL Official Playing Rules, Rule 8, Section 5; NFL Video Rulebook, Defensive Pass Interference.
+
+Defensive pass interference occurs when a Team B player more than one yard beyond the line of scrimmage significantly hinders an eligible receiver's opportunity to catch a forward pass thrown from behind the line of scrimmage. DPI applies from the time the pass is thrown until the ball is touched.
+
+Common indicators include early contact through the receiver, grabbing or restricting an arm, playing through the back, cutting off the receiver's path without playing the ball, hooking and turning the receiver, or contacting the receiver before the ball arrives in a way that materially prevents a catch opportunity.
+
+Video keys: pass thrown from behind the line, contact more than one yard downfield, ball arrival timing, whether the defender plays the ball, catchability, restriction severity, and whether the pass has been touched.

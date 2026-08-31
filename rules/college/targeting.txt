@@ -1,0 +1,8 @@
+Ruleset: NCAA college football.
+Source basis: 2025 NCAA Football Rules and Interpretations, Rule 9, Section 1, Articles 3 and 4; 2026 targeting disqualification administration changes should be applied separately from the foul decision.
+
+Targeting includes forcible contact with the crown of the helmet, or forcible contact to the head or neck area of a defenseless opponent, when at least one targeting indicator is present. Indicators include launch, upward thrust, crouch followed by upward/forward attack, leading with helmet/shoulder/forearm/fist/hand/elbow, or lowering the head before attacking with the crown.
+
+A defenseless player can include a receiver attempting to catch a pass, a player who has relaxed after the play, a passer during or just after a throw, a kick receiver focused on the ball, or a player whose forward progress is stopped.
+
+Video keys: exact contact point, whether contact is forcible, player posture, targeting indicators, defenseless status, and whether the crown of the helmet is used.

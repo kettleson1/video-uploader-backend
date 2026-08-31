@@ -29,16 +29,20 @@ CREATE EXTENSION IF NOT EXISTS vector;
 
 CREATE TABLE IF NOT EXISTS rules (
   id BIGSERIAL PRIMARY KEY,
+  ruleset TEXT NOT NULL DEFAULT 'high_school',
   title   TEXT,
   section TEXT,
   body    TEXT NOT NULL,
   embedding vector(3072)  -- <- enforce 3072-D
 );
 
+ALTER TABLE rules ADD COLUMN IF NOT EXISTS ruleset TEXT NOT NULL DEFAULT 'high_school';
+
 -- Remove duplicates before creating the unique index
 DELETE FROM rules a
 USING rules b
 WHERE a.ctid < b.ctid
+  AND a.ruleset = b.ruleset
   AND a.title = b.title
   AND a.section = b.section;
 
@@ -47,9 +51,10 @@ DO $$
 BEGIN
   IF NOT EXISTS (
     SELECT 1 FROM pg_indexes
-    WHERE schemaname = 'public' AND indexname = 'uq_rules_title_section'
+    WHERE schemaname = 'public' AND indexname = 'uq_rules_ruleset_title_section'
   ) THEN
-    EXECUTE 'CREATE UNIQUE INDEX uq_rules_title_section ON rules (title, section)';
+    DROP INDEX IF EXISTS uq_rules_title_section;
+    EXECUTE 'CREATE UNIQUE INDEX uq_rules_ruleset_title_section ON rules (ruleset, title, section)';
   END IF;
 END $$;
 """
@@ -67,7 +72,7 @@ def _vec_literal(vec: List[float]) -> str:
     """Format a pgvector literal like: [0.123,0.456,...]"""
     return "[" + ",".join(f"{x:.6f}" for x in vec) + "]"
 
-def upsert_rule_chunk(title: str, section: str, body: str) -> None:
+def upsert_rule_chunk(ruleset: str, title: str, section: str, body: str) -> None:
     """Insert or update a single rule chunk with its embedding."""
     emb = _embed_text(f"{title}\n{body}")
     # (Optional) sanity log once per run
@@ -75,15 +80,21 @@ def upsert_rule_chunk(title: str, section: str, body: str) -> None:
 
     vec = _vec_literal(emb)
     sql = text("""
-        INSERT INTO rules (title, section, body, embedding)
-        VALUES (:title, :section, :body, (:vec)::vector)
-        ON CONFLICT (title, section) DO UPDATE
+        INSERT INTO rules (ruleset, title, section, body, embedding)
+        VALUES (:ruleset, :title, :section, :body, (:vec)::vector)
+        ON CONFLICT (ruleset, title, section) DO UPDATE
         SET body = EXCLUDED.body,
             embedding = EXCLUDED.embedding
     """)
 
     with engine.begin() as conn:
-        conn.execute(sql, {"title": title, "section": section, "body": body, "vec": vec})
+        conn.execute(sql, {
+            "ruleset": ruleset,
+            "title": title,
+            "section": section,
+            "body": body,
+            "vec": vec,
+        })
 
 # -------------------------------------------------------------------
 # Main
@@ -93,7 +104,8 @@ def main() -> None:
     with engine.begin() as conn:
         conn.execute(text(DDL))
 
-    rules_dir = Path("rules")
+    ruleset = os.getenv("RULESET", "high_school").strip() or "high_school"
+    rules_dir = Path(os.getenv("RULES_DIR", "rules"))
     rules_dir.mkdir(parents=True, exist_ok=True)
 
     # Ingest every *.txt in /rules
@@ -109,8 +121,8 @@ def main() -> None:
             body = f.read().strip()
 
         # simple one-chunk strategy; extend to multi-chunk if needed
-        upsert_rule_chunk(title=title, section="chunk-0", body=body)
-        print(f"Upserted {title}:chunk-0")
+        upsert_rule_chunk(ruleset=ruleset, title=title, section="chunk-0", body=body)
+        print(f"Upserted {ruleset}:{title}:chunk-0")
         inserted += 1
 
     print(f"✅ Ingest complete. Total chunks upserted: {inserted}")

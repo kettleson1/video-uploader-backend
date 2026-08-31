@@ -1,0 +1,8 @@
+Ruleset: NFL pro football.
+Source basis: 2025 NFL Official Playing Rules, Rule 12, Section 2, Article 11; NFL Video Rulebook, Roughing the Passer.
+
+Roughing the passer applies special protection to a player in a passing posture before, during, or after a pass attempt. Fouls include unnecessary or avoidable forcible contact, contact to the head or neck area, driving or landing with body weight, or forcibly hitting at or below the passer's knee area without an exception.
+
+A defender may complete unavoidable contact when already committed, but must avoid unnecessary force when the pass is gone and the passer is vulnerable.
+
+Video keys: pass release timing, defender steps after release, contact point, body-weight action, low contact, head or neck contact, and whether the defender could avoid or reduce the blow.

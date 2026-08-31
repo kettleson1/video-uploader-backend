@@ -1,0 +1,8 @@
+Ruleset: NFL pro football.
+Source basis: 2025 NFL Official Playing Rules, Rule 10, opportunity to catch a kick.
+
+Kick-catch interference occurs when the kicking team interferes with the receiver's opportunity to catch a kick before the receiver touches the ball. The receiver must be given a clear opportunity to complete the catch, and contact, obstruction, or forced movement before the catch can be a foul.
+
+Consider whether the opponent was blocked into the receiver, whether the receiver muffed the ball before contact, and whether the kick had already touched the ground or another player.
+
+Video keys: receiver position and focus, ball arrival, contact or obstruction timing, fair-catch signal if any, block into the receiver, and whether the receiver first touches or muffs the kick.

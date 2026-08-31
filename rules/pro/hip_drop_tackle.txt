@@ -1,0 +1,8 @@
+Ruleset: NFL pro football.
+Source basis: 2025 NFL Official Playing Rules, Rule 12, Section 2, Article 18; NFL Video Rulebook, Hip-Drop Tackle.
+
+A prohibited hip-drop tackle involves a defender grabbing or wrapping the runner with both hands or arms, unweighting by swiveling or dropping the hips, and landing on or trapping the runner's legs at or below the knee. The action is evaluated as a sequence, not just a hard tackle.
+
+Do not call the foul when the defender simply makes a legal wrap tackle, falls to the ground without the hip-drop action, or lands away from the runner's legs.
+
+Video keys: wrap with both hands or arms, hip swivel/drop, defender unweighting, landing location, contact to legs at or below the knee, and runner's leg being trapped.

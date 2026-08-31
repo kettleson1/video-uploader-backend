@@ -1,0 +1,8 @@
+Ruleset: NCAA college football.
+Source basis: 2025 NCAA Football Rules and Interpretations, Rule 7, Section 3, Article 8 and Article 9; apply with 2026 rule-change updates when adopted.
+
+Defensive pass interference occurs when a Team B player, beyond the neutral zone, significantly hinders an eligible Team A receiver's opportunity to catch a catchable legal forward pass before the ball arrives. Indicators include early contact through the receiver, grabbing or restricting an arm, playing through the back, cutting off the receiver without playing the ball, or hooking and turning the receiver before the pass is touched.
+
+There is no defensive pass interference when contact is incidental, both players are making a bona fide attempt to reach the ball, the pass is clearly uncatchable, the contact occurs behind the neutral zone, or the pass has already been touched.
+
+Video keys: ball flight and catchability, timing of contact relative to ball arrival, whether the defender plays the ball, material restriction of the receiver, and whether the contact occurs beyond the neutral zone.

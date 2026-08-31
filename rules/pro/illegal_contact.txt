@@ -1,0 +1,8 @@
+Ruleset: NFL pro football.
+Source basis: 2025 NFL Official Playing Rules, Rule 8, Section 4; NFL Video Rulebook, Illegal Contact.
+
+Illegal contact occurs when a defender makes prohibited contact with an eligible receiver after the receiver is more than five yards beyond the line of scrimmage and before the ball is thrown, while the quarterback still has the ball in the pocket. Within five yards, a defender may chuck an eligible receiver in front of him and maintain continuous contact only within the allowed zone.
+
+Once the ball is in the air, evaluate pass interference instead of illegal contact. If the quarterback has left the pocket or the ball has been thrown, the illegal-contact window may no longer apply.
+
+Video keys: receiver depth, contact timing before or after pass release, quarterback location in or out of pocket, continuous contact, and whether the contact restricts the route.

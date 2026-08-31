@@ -1,0 +1,8 @@
+Ruleset: NFL pro football.
+Source basis: 2025 NFL Official Playing Rules, Rule 7, Section 5.
+
+Illegal formation occurs when the offense is not legally aligned at the snap. NFL review should verify that seven players are on the line of scrimmage, eligible receivers are properly positioned or reported, the line is balanced as required, and no player is improperly covered or aligned in a way that violates numbering or position rules.
+
+Formation rulings depend on a freeze-frame at the snap and clear visibility of all offensive players. If the clip does not show the full formation at the snap, mark the ruling uncertain.
+
+Video keys: frame at snap, count line players, identify covered and uncovered receivers, check jersey-number eligibility or reporting, and confirm backfield depth.

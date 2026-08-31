@@ -1,0 +1,8 @@
+Ruleset: NFL pro football.
+Source basis: 2025 NFL Official Playing Rules, Rule 12, Section 1; NFL Video Rulebook, Offensive Holding.
+
+Offensive holding is the illegal use of hands, arms, or body control to materially restrict an opponent. Indicators include grasping, hooking, tackling, pulling, turning, preventing separation, or taking a defender to the ground when the defender is trying to disengage or pursue the ball.
+
+Legal blocking allows open-hand engagement and control within the frame when the blocker does not grab, restrict, or materially alter the defender's path. The foul is stronger when the restriction affects the point of attack or prevents a defender from making a play.
+
+Video keys: grab or hook, jersey stretch, arm outside the frame, takedown, defender path to the ball, point of attack, and whether the defender is attempting to disengage.

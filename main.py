@@ -3,19 +3,23 @@ import re
 import io
 import json
 import base64
+import hashlib
+import hmac
 import tempfile
 import subprocess
 import secrets
+import time
 from datetime import datetime, timezone
 from typing import List, Optional
-from models import Upload, Rule
+from models import Game, Upload, Rule
+from coaches_film_detector import detect_play_boundaries, extract_activity_samples
 
 import boto3
 from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, Query, Body, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import create_engine, func, or_
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy import text as sqltext
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -24,8 +28,6 @@ import asyncio
 from openai import AsyncOpenAI
 
 from database import async_session
-
-from models import Upload  # must include retrieved_rules, human_label, human_notes, reviewed_at
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -58,10 +60,25 @@ if not (BUCKET_NAME and DATABASE_URL and OPENAI_API_KEY):
     raise RuntimeError("Missing required env vars: AWS_S3_BUCKET, DATABASE_URL, OPENAI_API_KEY")
 
 s3_client = boto3.client("s3", region_name=AWS_REGION)
-engine = create_engine(
-DATABASE_URL)
+SYNC_DATABASE_URL = DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://")
+engine = create_engine(SYNC_DATABASE_URL)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+
+RULESETS = {
+    "high_school": {
+        "label": "NFHS high school football",
+        "assistant": "an expert NFHS high school football officiating video analyst",
+    },
+    "college": {
+        "label": "NCAA college football",
+        "assistant": "an expert NCAA college football officiating video analyst",
+    },
+    "pro": {
+        "label": "NFL pro football",
+        "assistant": "an expert NFL pro football officiating video analyst",
+    },
+}
 
 # ------------------------------------------------------------------------------
 # FastAPI
@@ -80,23 +97,90 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.on_event("startup")
+def ensure_ruleset_columns():
+    with engine.begin() as conn:
+        conn.execute(sqltext("""
+            CREATE TABLE IF NOT EXISTS games (
+                id BIGSERIAL PRIMARY KEY,
+                title TEXT,
+                source_type TEXT DEFAULT 'file',
+                source_url TEXT,
+                s3_url TEXT NOT NULL,
+                ruleset TEXT NOT NULL DEFAULT 'high_school',
+                status TEXT DEFAULT 'queued',
+                progress DOUBLE PRECISION DEFAULT 0,
+                error_message TEXT,
+                segment_count INTEGER DEFAULT 0,
+                analyzed_count INTEGER DEFAULT 0,
+                created_at TIMESTAMP,
+                segmented_at TIMESTAMP,
+                analyzed_at TIMESTAMP
+            )
+        """))
+        conn.execute(sqltext("ALTER TABLE IF EXISTS uploads ADD COLUMN IF NOT EXISTS ruleset TEXT NOT NULL DEFAULT 'high_school'"))
+        conn.execute(sqltext("ALTER TABLE IF EXISTS uploads ADD COLUMN IF NOT EXISTS game_id BIGINT"))
+        conn.execute(sqltext("ALTER TABLE IF EXISTS uploads ADD COLUMN IF NOT EXISTS play_number INTEGER"))
+        conn.execute(sqltext("ALTER TABLE IF EXISTS uploads ADD COLUMN IF NOT EXISTS start_time DOUBLE PRECISION"))
+        conn.execute(sqltext("ALTER TABLE IF EXISTS uploads ADD COLUMN IF NOT EXISTS end_time DOUBLE PRECISION"))
+        conn.execute(sqltext("ALTER TABLE IF EXISTS uploads ADD COLUMN IF NOT EXISTS segment_confidence DOUBLE PRECISION"))
+        conn.execute(sqltext("ALTER TABLE IF EXISTS uploads ADD COLUMN IF NOT EXISTS clip_s3_url TEXT"))
+        conn.execute(sqltext("ALTER TABLE IF EXISTS uploads ADD COLUMN IF NOT EXISTS result TEXT"))
+        conn.execute(sqltext("ALTER TABLE IF EXISTS rules ADD COLUMN IF NOT EXISTS ruleset TEXT NOT NULL DEFAULT 'high_school'"))
+
 # Dependency to get the database session
 async def get_db():
     async with async_session() as session:
         yield session
 
-def require_api_key(x_dave_api_key: Optional[str] = Header(None, alias="X-DAVE-API-Key")):
+def _decode_session_token(token: str) -> Optional[dict]:
+    """Validate a short-lived token issued by the WordPress plugin."""
+    try:
+        encoded_payload, supplied_signature = token.split(".", 1)
+        expected_signature = base64.urlsafe_b64encode(
+            hmac.new(
+                DAVE_API_KEY.encode("utf-8"),
+                encoded_payload.encode("ascii"),
+                hashlib.sha256,
+            ).digest()
+        ).rstrip(b"=").decode("ascii")
+        if not secrets.compare_digest(supplied_signature, expected_signature):
+            return None
+
+        padding = "=" * (-len(encoded_payload) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(encoded_payload + padding))
+        now = int(time.time())
+        expires_at = int(payload.get("exp", 0))
+        if payload.get("v") != 1 or not payload.get("sub"):
+            return None
+        if expires_at <= now or expires_at > now + 3600:
+            return None
+        return payload
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def require_api_key(
+    x_dave_api_key: Optional[str] = Header(None, alias="X-DAVE-API-Key"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+):
     if not DAVE_API_KEY:
         raise HTTPException(status_code=503, detail="API authentication is not configured")
-    if not x_dave_api_key or not secrets.compare_digest(x_dave_api_key, DAVE_API_KEY):
-        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+    if x_dave_api_key and secrets.compare_digest(x_dave_api_key, DAVE_API_KEY):
+        return
+    if authorization and authorization.startswith("Bearer "):
+        if _decode_session_token(authorization[7:].strip()):
+            return
+    raise HTTPException(status_code=401, detail="Invalid or missing API authorization")
 
 @app.get("/api/rules/list")
 async def list_rules(
+    ruleset: str = Query("high_school"),
     db: AsyncSession = Depends(get_db),
     _auth: None = Depends(require_api_key),
 ):
-    result = await db.execute(select(Rule))
+    result = await db.execute(select(Rule).where(Rule.ruleset == _normalize_ruleset(ruleset)))
     rules = result.scalars().all()
     return [{"label": r.title, "value": r.title} for r in rules]
 
@@ -106,6 +190,20 @@ async def list_rules(
 class UploadResponse(BaseModel):
     id: int
     s3_url: str
+
+class GameUploadResponse(BaseModel):
+    id: int
+    s3_url: str
+
+class SegmentIn(BaseModel):
+    id: Optional[int] = None
+    play_number: Optional[int] = None
+    start_time: float
+    end_time: float
+    notes: Optional[str] = None
+
+class SegmentsPayload(BaseModel):
+    segments: List[SegmentIn]
 
 class ReviewPayload(BaseModel):
     human_label: Optional[str] = None
@@ -122,6 +220,19 @@ class OfficialFeedbackIn(BaseModel):
 # ------------------------------------------------------------------------------
 def _now_utc():
     return datetime.utcnow()
+
+def _normalize_ruleset(ruleset: Optional[str]) -> str:
+    normalized = (ruleset or "high_school").strip().lower().replace("-", "_")
+    if normalized in {"nfhs", "highschool", "high_school"}:
+        return "high_school"
+    if normalized in {"ncaa", "college"}:
+        return "college"
+    if normalized in {"nfl", "pro", "professional"}:
+        return "pro"
+    raise HTTPException(status_code=400, detail=f"Unsupported ruleset: {ruleset}")
+
+def _ruleset_context(ruleset: str) -> dict:
+    return RULESETS.get(ruleset, RULESETS["high_school"])
 
 def _safe_err_text(e: Exception) -> str:
     try:
@@ -206,10 +317,75 @@ def _extract_frames(video_bytes: bytes, fps: int = 1, max_frames: int = 6) -> Li
                 frames_b64.append(b64)
     return frames_b64
 
+def _probe_video_duration(video_bytes: bytes) -> float:
+    with tempfile.TemporaryDirectory() as td:
+        src = os.path.join(td, "game.mp4")
+        with open(src, "wb") as f:
+            f.write(video_bytes)
+        cmd = [
+            "ffprobe",
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            src,
+        ]
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+        try:
+            return max(0.0, float((proc.stdout or "0").strip()))
+        except ValueError:
+            return 0.0
+
+def _detect_play_segments(video_bytes: bytes) -> List[dict]:
+    """
+    Detect editable play candidates from continuous coaches film.
+    """
+    duration = _probe_video_duration(video_bytes)
+    if duration <= 0:
+        return []
+    samples = extract_activity_samples(video_bytes)
+    return detect_play_boundaries(samples, duration)
+
+def _extract_clip_bytes(video_bytes: bytes, start_time: float, end_time: float) -> bytes:
+    start_time = max(0.0, float(start_time))
+    duration = max(1.0, float(end_time) - start_time)
+    with tempfile.TemporaryDirectory() as td:
+        src = os.path.join(td, "game.mp4")
+        out = os.path.join(td, "clip.mp4")
+        with open(src, "wb") as f:
+            f.write(video_bytes)
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", f"{start_time:.3f}",
+            "-i", src,
+            "-t", f"{duration:.3f}",
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "28",
+            "-c:a", "aac",
+            "-movflags", "+faststart",
+            out,
+        ]
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        if proc.returncode != 0 or not os.path.exists(out):
+            raise RuntimeError("Clip extraction failed")
+        with open(out, "rb") as f:
+            return f.read()
+
+def _result_from_label(label: str, confidence: float) -> str:
+    normalized = (label or "").strip().lower().replace("_", " ").replace("-", " ")
+    if confidence < CONFIDENCE_THRESHOLD:
+        return "UNCERTAIN"
+    if normalized in {"", "none", "no foul", "no penalty"}:
+        return "NO FOUL"
+    if normalized == "uncertain":
+        return "UNCERTAIN"
+    return "FOUL"
+
 async def _summarize_frames_async(
     frames_b64: List[str],
     foul_hint: str = "",
     notes: str = "",
+    ruleset: str = "high_school",
 ) -> str:
     """
     Async: Summarize the play from a handful of actual video frames.
@@ -217,8 +393,9 @@ async def _summarize_frames_async(
     if not frames_b64:
         return "No visual context available."
 
+    rules_context = _ruleset_context(ruleset)
     system_prompt = (
-        "You are an expert NFHS high school football officiating video analyst. "
+        f"You are {rules_context['assistant']}. "
         "Describe only what is visible in the frames. Be precise about timing, "
         "player roles, ball location, contact type, target area, and whether the "
         "action is clear or ambiguous. Do not invent unseen action."
@@ -226,6 +403,7 @@ async def _summarize_frames_async(
 
     user_text = (
         f"Analyze these {len(frames_b64)} chronological frames from one football play.\n"
+        f"Ruleset to apply later: {rules_context['label']}\n"
         f"Selected foul type from the form: {foul_hint or 'not provided'}\n"
         f"Official/user notes: {notes or 'none'}\n\n"
         "Return a compact evidence summary for rule lookup with these fields:\n"
@@ -272,7 +450,7 @@ async def _embed_text(text_in: str) -> List[float]:
 # ------------------------------------------------------------------------------
 # Async rule retrieval using pgvector
 # ------------------------------------------------------------------------------
-async def _retrieve_rules_async(summary: str, top_k: int = 3) -> List[dict]:
+async def _retrieve_rules_async(summary: str, top_k: int = 3, ruleset: str = "high_school") -> List[dict]:
     """
     Async: Retrieve closest rule chunks via pgvector (cosine).
     Column type: vector(3072)
@@ -288,12 +466,17 @@ async def _retrieve_rules_async(summary: str, top_k: int = 3) -> List[dict]:
             body,
             1 - (embedding <=> (:qvec)::vector) AS score
         FROM rules
+        WHERE ruleset = :ruleset
         ORDER BY embedding <=> (:qvec)::vector
         LIMIT :k
     """)
 
     async with async_session() as session:
-        rows = (await session.execute(sql, {"qvec": qvec_literal, "k": top_k})).mappings().all()
+        rows = (await session.execute(sql, {
+            "qvec": qvec_literal,
+            "k": top_k,
+            "ruleset": ruleset,
+        })).mappings().all()
 
     # Make sure everything is JSON-serializable (no Decimals)
     out = []
@@ -312,6 +495,7 @@ async def _predict_with_rules(
     retrieved: list[dict],
     foul_hint: str = "",
     notes: str = "",
+    ruleset: str = "high_school",
 ) -> tuple[str, float, str]:
     """
     Use LLM to choose a label and produce confidence + explanation.
@@ -327,14 +511,16 @@ async def _predict_with_rules(
         parts.append(f"- {title}{section_str}\n{body}")
     rules_snips = "\n\n".join(parts).strip() or "No matching rule snippets."
 
+    rules_context = _ruleset_context(ruleset)
     sys_prompt = (
-        "You are an NFHS high school football rules assistant. "
+        f"You are a {rules_context['label']} rules assistant. "
         "Choose the most likely foul label only when the video evidence and rule snippets support it. "
         "If the evidence is unclear or no provided rule fits, use 'None' or 'Uncertain'. "
         "Ground the explanation in visible evidence and the cited snippets."
     )
     user_prompt = (
         f"PLAY SUMMARY:\n{summary}\n\n"
+        f"RULESET:\n{rules_context['label']}\n\n"
         f"SELECTED FOUL TYPE/HINT:\n{foul_hint or 'not provided'}\n\n"
         f"OFFICIAL/USER NOTES:\n{notes or 'none'}\n\n"
         f"CANDIDATE RULE SNIPPETS:\n{rules_snips}\n\n"
@@ -375,10 +561,119 @@ async def _predict_with_rules(
             f"'{foul_hint or 'not provided'}', and the top retrieved rule {rule_title}."
         )
     return label, conf, expl
+
+async def _predict_batch_with_rules(
+    summary: str,
+    retrieved: list[dict],
+    notes: str = "",
+    ruleset: str = "high_school",
+    start_time: Optional[float] = None,
+    end_time: Optional[float] = None,
+) -> dict:
+    parts: list[str] = []
+    for r in (retrieved or []):
+        title = str(r.get("title", ""))
+        section = r.get("section")
+        section_str = f" ({section})" if section else ""
+        body = str(r.get("body", ""))
+        parts.append(f"- {title}{section_str}\n{body}")
+    rules_snips = "\n\n".join(parts).strip() or "No matching rule snippets."
+
+    rules_context = _ruleset_context(ruleset)
+    time_text = ""
+    if start_time is not None and end_time is not None:
+        time_text = f"\nPLAY TIMESTAMP: {start_time:.2f}s to {end_time:.2f}s\n"
+
+    sys_prompt = (
+        f"You are a {rules_context['label']} officiating review assistant. "
+        "You are not making an official ruling. Decide whether the visible evidence supports "
+        "FOUL, NO FOUL, or UNCERTAIN. Only classify a foul when the visible evidence and "
+        "rule snippets support the required elements."
+    )
+    user_prompt = (
+        f"PLAY SUMMARY:\n{summary}\n"
+        f"{time_text}\n"
+        f"OFFICIAL/USER NOTES:\n{notes or 'none'}\n\n"
+        f"CANDIDATE RULE SNIPPETS:\n{rules_snips}\n\n"
+        "Respond as JSON with exactly these keys:\n"
+        "- result: FOUL, NO FOUL, or UNCERTAIN\n"
+        "- label: foul label, None for no foul, or Uncertain\n"
+        "- confidence: number from 0 to 1\n"
+        "- rule_citations: array of rule titles or sections used\n"
+        "- evidence_summary: concise visible evidence\n"
+        "- why_foul_or_no_foul: rule-grounded reasoning\n"
+        "- uncertainty_notes: what is unclear or missing"
+    )
+
+    chat = await client.chat.completions.create(
+        model=os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini"),
+        messages=[
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0.1,
+        max_tokens=420,
+        response_format={"type": "json_object"},
+    )
+    txt = (chat.choices[0].message.content or "").strip()
+
+    fallback = {
+        "result": "UNCERTAIN",
+        "label": "Uncertain",
+        "confidence": 0.0,
+        "rule_citations": [],
+        "evidence_summary": summary,
+        "why_foul_or_no_foul": "The model did not return a usable structured result.",
+        "uncertainty_notes": txt[:300],
+    }
+    try:
+        if txt.startswith("```"):
+            txt = "\n".join(txt.splitlines()[1:])
+        if txt.endswith("```"):
+            txt = "\n".join(txt.splitlines()[:-1])
+        data = json.loads(txt)
+    except Exception:
+        return fallback
+
+    result = str(data.get("result", "UNCERTAIN")).strip().upper()
+    if result not in {"FOUL", "NO FOUL", "UNCERTAIN"}:
+        result = "UNCERTAIN"
+    confidence = _coerce_confidence(data.get("confidence"), 0.0)
+    if confidence < CONFIDENCE_THRESHOLD and result == "FOUL":
+        result = "UNCERTAIN"
+
+    if result == "NO FOUL":
+        label = "None"
+    elif result == "UNCERTAIN":
+        label = "Uncertain"
+    else:
+        label = str(data.get("label") or "Uncertain").strip()
+        if label.lower() in {"", "none", "no foul", "uncertain"}:
+            result = "UNCERTAIN"
+            label = "Uncertain"
+    citations = data.get("rule_citations") or []
+    if not isinstance(citations, list):
+        citations = [str(citations)]
+
+    return {
+        "result": result,
+        "label": label,
+        "confidence": confidence,
+        "rule_citations": [str(item) for item in citations],
+        "evidence_summary": str(data.get("evidence_summary") or summary).strip(),
+        "why_foul_or_no_foul": str(data.get("why_foul_or_no_foul") or "").strip(),
+        "uncertainty_notes": str(data.get("uncertainty_notes") or "").strip(),
+    }
 # ------------------------------------------------------------------------------
 # Background worker (async version)
 # ------------------------------------------------------------------------------
-async def _process_upload_bg(upload_id: int, s3_url: str, foul_hint: str, notes: str = ""):
+async def _process_upload_bg(
+    upload_id: int,
+    s3_url: str,
+    foul_hint: str,
+    notes: str = "",
+    ruleset: str = "high_school",
+):
     async with async_session() as db:
         try:
             print(f"📥 Starting processing for upload_id={upload_id}")
@@ -394,14 +689,20 @@ async def _process_upload_bg(upload_id: int, s3_url: str, foul_hint: str, notes:
             frames = _extract_frames(video_bytes, fps=1, max_frames=6)
             print(f"📸 Extracted {len(frames)} frames")
 
-            summary = await _summarize_frames_async(frames, foul_hint=foul_hint, notes=notes)
+            ruleset = _normalize_ruleset(ruleset)
+            summary = await _summarize_frames_async(
+                frames,
+                foul_hint=foul_hint,
+                notes=notes,
+                ruleset=ruleset,
+            )
             print(f"✍️ Summary: {summary}")
 
             # 3) Retrieve rules (async)
             retrieval_query = "\n".join(
                 part for part in [summary, f"Foul hint: {foul_hint}" if foul_hint else "", notes] if part
             )
-            retrieved = await _retrieve_rules_async(retrieval_query, top_k=6)
+            retrieved = await _retrieve_rules_async(retrieval_query, top_k=6, ruleset=ruleset)
             print(f"📚 Retrieved {len(retrieved)} rules")
             
             # 4) Decide with LLM
@@ -410,6 +711,7 @@ async def _process_upload_bg(upload_id: int, s3_url: str, foul_hint: str, notes:
                 retrieved,
                 foul_hint=foul_hint,
                 notes=notes,
+                ruleset=ruleset,
             )
             print(f"📊 Predicted: {label} (confidence={confidence})")
 
@@ -426,6 +728,7 @@ async def _process_upload_bg(upload_id: int, s3_url: str, foul_hint: str, notes:
             if row:
                 row.status = "done"
                 row.prediction_label = final_label
+                row.result = _result_from_label(final_label, final_conf)
                 row.confidence = final_conf
                 row.explanation = explanation_text
                 row.processed_at = _now_utc()
@@ -443,6 +746,225 @@ async def _process_upload_bg(upload_id: int, s3_url: str, foul_hint: str, notes:
                 await db.commit()
 
 # ------------------------------------------------------------------------------
+# Batch game processing
+# ------------------------------------------------------------------------------
+def _game_to_dict(game: Game) -> dict:
+    return {
+        "id": game.id,
+        "title": game.title,
+        "source_type": game.source_type,
+        "source_url": game.source_url,
+        "s3_url": game.s3_url,
+        "ruleset": game.ruleset,
+        "status": game.status,
+        "progress": game.progress,
+        "error_message": game.error_message,
+        "segment_count": game.segment_count,
+        "analyzed_count": game.analyzed_count,
+        "created_at": game.created_at.isoformat() if game.created_at else None,
+        "segmented_at": game.segmented_at.isoformat() if game.segmented_at else None,
+        "analyzed_at": game.analyzed_at.isoformat() if game.analyzed_at else None,
+    }
+
+def _play_to_dict(play: Upload) -> dict:
+    video_url = play.clip_s3_url or play.s3_url
+    key = _s3_key_from_url(video_url) if video_url else ""
+    presigned = _presign(key, 3600) if key else None
+    official_agrees = None
+    if getattr(play, "reviewed_at", None) and getattr(play, "human_label", None) and play.prediction_label:
+        official_agrees = play.human_label == play.prediction_label
+    return {
+        "id": play.id,
+        "game_id": play.game_id,
+        "play_number": play.play_number,
+        "start_time": play.start_time,
+        "end_time": play.end_time,
+        "segment_confidence": play.segment_confidence,
+        "foul_type": play.foul_type,
+        "notes": play.notes,
+        "ruleset": getattr(play, "ruleset", "high_school"),
+        "timestamp": play.timestamp.isoformat() if play.timestamp else None,
+        "status": play.status,
+        "result": play.result,
+        "prediction_label": play.prediction_label,
+        "confidence": play.confidence,
+        "processed_at": play.processed_at.isoformat() if play.processed_at else None,
+        "error_message": play.error_message,
+        "explanation": getattr(play, "explanation", None),
+        "retrieved_rules": getattr(play, "retrieved_rules", None),
+        "human_label": getattr(play, "human_label", None),
+        "human_notes": getattr(play, "human_notes", None),
+        "reviewed_at": play.reviewed_at.isoformat() if getattr(play, "reviewed_at", None) else None,
+        "official_agrees": official_agrees,
+        "s3_url": play.s3_url,
+        "clip_s3_url": play.clip_s3_url,
+        "presigned_url": presigned,
+    }
+
+async def _segment_game_bg(game_id: int):
+    async with async_session() as db:
+        try:
+            result = await db.execute(select(Game).where(Game.id == game_id))
+            game = result.scalar_one_or_none()
+            if not game:
+                return
+
+            game.status = "segmenting"
+            game.progress = 0.05
+            game.error_message = None
+            await db.commit()
+
+            key = _s3_key_from_url(game.s3_url)
+            obj = s3_client.get_object(Bucket=BUCKET_NAME, Key=key)
+            video_bytes: bytes = obj["Body"].read()
+            segments = _detect_play_segments(video_bytes)
+
+            if not segments:
+                raise RuntimeError("No playable segments could be detected in the uploaded video.")
+
+            for segment in segments:
+                db.add(Upload(
+                    game_id=game.id,
+                    play_number=segment["play_number"],
+                    start_time=segment["start_time"],
+                    end_time=segment["end_time"],
+                    segment_confidence=segment["segment_confidence"],
+                    s3_url=game.s3_url,
+                    foul_type="",
+                    notes="",
+                    ruleset=game.ruleset,
+                    timestamp=_now_utc(),
+                    status="segmented",
+                    result=None,
+                ))
+
+            game.status = "segments_ready"
+            game.progress = 0.25
+            game.segment_count = len(segments)
+            game.segmented_at = _now_utc()
+            await db.commit()
+        except Exception as e:
+            result = await db.execute(select(Game).where(Game.id == game_id))
+            game = result.scalar_one_or_none()
+            if game:
+                game.status = "error"
+                game.error_message = _safe_err_text(e)
+                await db.commit()
+
+async def _analyze_game_bg(game_id: int):
+    async with async_session() as db:
+        try:
+            result = await db.execute(select(Game).where(Game.id == game_id))
+            game = result.scalar_one_or_none()
+            if not game:
+                return
+
+            plays_result = await db.execute(
+                select(Upload)
+                .where(Upload.game_id == game_id)
+                .order_by(Upload.play_number.asc(), Upload.start_time.asc())
+            )
+            plays = plays_result.scalars().all()
+            if not plays:
+                game.status = "error"
+                game.error_message = "No play segments are available to analyze."
+                await db.commit()
+                return
+
+            game.status = "analyzing"
+            game.progress = 0.30
+            game.error_message = None
+            game.analyzed_count = 0
+            await db.commit()
+
+            key = _s3_key_from_url(game.s3_url)
+            obj = s3_client.get_object(Bucket=BUCKET_NAME, Key=key)
+            video_bytes: bytes = obj["Body"].read()
+            total = len(plays)
+
+            failed_count = 0
+            for index, play in enumerate(plays, start=1):
+                play.status = "processing"
+                play.error_message = None
+                await db.commit()
+
+                try:
+                    clip_bytes = _extract_clip_bytes(video_bytes, play.start_time or 0.0, play.end_time or 0.0)
+                    stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S%fZ")
+                    key_name = f"games/{game.id}/plays/{play.play_number or index}_{stamp}.mp4"
+                    s3_client.put_object(Bucket=BUCKET_NAME, Key=key_name, Body=clip_bytes, ContentType="video/mp4")
+                    clip_s3_url = f"https://{BUCKET_NAME}.s3.{AWS_REGION}.amazonaws.com/{key_name}"
+
+                    frames = _extract_frames(clip_bytes, fps=1, max_frames=8)
+                    summary = await _summarize_frames_async(
+                        frames,
+                        foul_hint="",
+                        notes=play.notes or "",
+                        ruleset=game.ruleset,
+                    )
+                    retrieval_query = "\n".join(
+                        part for part in [
+                            summary,
+                            f"Play timestamp: {play.start_time:.2f}s to {play.end_time:.2f}s",
+                            play.notes or "",
+                        ] if part
+                    )
+                    retrieved = await _retrieve_rules_async(retrieval_query, top_k=6, ruleset=game.ruleset)
+                    prediction = await _predict_batch_with_rules(
+                        summary,
+                        retrieved,
+                        notes=play.notes or "",
+                        ruleset=game.ruleset,
+                        start_time=play.start_time,
+                        end_time=play.end_time,
+                    )
+
+                    label = prediction["label"]
+                    explanation_payload = {
+                        "rule_citations": prediction["rule_citations"],
+                        "evidence_summary": prediction["evidence_summary"],
+                        "why_foul_or_no_foul": prediction["why_foul_or_no_foul"],
+                        "uncertainty_notes": prediction["uncertainty_notes"],
+                    }
+
+                    play.clip_s3_url = clip_s3_url
+                    play.s3_url = clip_s3_url
+                    play.status = "done"
+                    play.result = prediction["result"]
+                    play.prediction_label = label
+                    play.confidence = prediction["confidence"]
+                    play.explanation = json.dumps(explanation_payload)
+                    play.retrieved_rules = retrieved
+                    play.processed_at = _now_utc()
+                    play.error_message = None
+                except Exception as play_error:
+                    play.status = "error"
+                    play.error_message = _safe_err_text(play_error)
+                    play.processed_at = _now_utc()
+                    failed_count += 1
+
+                game.analyzed_count = index
+                game.progress = 0.30 + (0.70 * index / total)
+                await db.commit()
+
+            game.status = "done" if failed_count == 0 else "error"
+            game.progress = 1.0
+            game.analyzed_at = _now_utc()
+            game.error_message = (
+                None
+                if failed_count == 0
+                else f"{failed_count} of {total} play analyses failed."
+            )
+            await db.commit()
+        except Exception as e:
+            result = await db.execute(select(Game).where(Game.id == game_id))
+            game = result.scalar_one_or_none()
+            if game:
+                game.status = "error"
+                game.error_message = _safe_err_text(e)
+                await db.commit()
+
+# ------------------------------------------------------------------------------
 # Routes
 # ------------------------------------------------------------------------------
 @app.get("/health")
@@ -454,17 +976,177 @@ class ReviewIn(BaseModel):
     label: str
     notes: Optional[str] = None
 
+@app.post("/api/games/upload", response_model=GameUploadResponse)
+async def upload_game_video(
+    file: UploadFile = File(...),
+    title: str = Form(""),
+    ruleset: str = Form("high_school"),
+    db: AsyncSession = Depends(get_db),
+    _auth: None = Depends(require_api_key),
+):
+    try:
+        ruleset = _normalize_ruleset(ruleset)
+        data = await file.read()
+        clean_name = re.sub(r"[^A-Za-z0-9._-]+", "_", file.filename or "game.mp4")
+        stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S%fZ")
+        key = f"games/{stamp}_{clean_name}"
+        s3_client.put_object(Bucket=BUCKET_NAME, Key=key, Body=data, ContentType=file.content_type or "video/mp4")
+        s3_url = f"https://{BUCKET_NAME}.s3.{AWS_REGION}.amazonaws.com/{key}"
+
+        rec = Game(
+            title=title.strip() or clean_name,
+            source_type="file",
+            source_url=None,
+            s3_url=s3_url,
+            ruleset=ruleset,
+            status="queued",
+            progress=0.0,
+            created_at=_now_utc(),
+        )
+        db.add(rec)
+        await db.commit()
+        await db.refresh(rec)
+        asyncio.create_task(_segment_game_bg(rec.id))
+        return GameUploadResponse(id=rec.id, s3_url=s3_url)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=_safe_err_text(e))
+
+@app.get("/api/games")
+async def list_games(
+    limit: int = Query(25, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    ruleset: str = Query("high_school"),
+    db: AsyncSession = Depends(get_db),
+    _auth: None = Depends(require_api_key),
+):
+    ruleset = _normalize_ruleset(ruleset)
+    result = await db.execute(
+        select(Game)
+        .where(Game.ruleset == ruleset)
+        .order_by(Game.id.desc())
+        .offset(offset)
+        .limit(limit)
+    )
+    rows = result.scalars().all()
+    total_result = await db.execute(select(func.count()).select_from(Game).where(Game.ruleset == ruleset))
+    return {
+        "items": [_game_to_dict(row) for row in rows],
+        "total": total_result.scalar_one(),
+        "limit": limit,
+        "offset": offset,
+    }
+
+@app.get("/api/games/{game_id}")
+async def get_game(
+    game_id: int,
+    db: AsyncSession = Depends(get_db),
+    _auth: None = Depends(require_api_key),
+):
+    result = await db.execute(select(Game).where(Game.id == game_id))
+    game = result.scalar_one_or_none()
+    if not game:
+        raise HTTPException(status_code=404, detail="Game not found")
+    data = _game_to_dict(game)
+    key = _s3_key_from_url(game.s3_url)
+    data["presigned_url"] = _presign(key, 3600)
+    return data
+
+@app.get("/api/games/{game_id}/plays")
+async def get_game_plays(
+    game_id: int,
+    result: Optional[str] = Query(None),
+    reviewed: Optional[bool] = Query(None),
+    db: AsyncSession = Depends(get_db),
+    _auth: None = Depends(require_api_key),
+):
+    filters = [Upload.game_id == game_id]
+    if result:
+        filters.append(Upload.result == result)
+    if reviewed is not None:
+        filters.append(Upload.reviewed_at.isnot(None) if reviewed else Upload.reviewed_at.is_(None))
+    rows_result = await db.execute(
+        select(Upload).where(*filters).order_by(Upload.play_number.asc(), Upload.start_time.asc())
+    )
+    rows = rows_result.scalars().all()
+    return {"items": [_play_to_dict(row) for row in rows], "total": len(rows)}
+
+@app.patch("/api/games/{game_id}/segments")
+async def update_game_segments(
+    game_id: int,
+    payload: SegmentsPayload,
+    db: AsyncSession = Depends(get_db),
+    _auth: None = Depends(require_api_key),
+):
+    game_result = await db.execute(select(Game).where(Game.id == game_id))
+    game = game_result.scalar_one_or_none()
+    if not game:
+        raise HTTPException(status_code=404, detail="Game not found")
+    if game.status == "analyzing":
+        raise HTTPException(status_code=409, detail="Cannot edit segments while analysis is running")
+
+    await db.execute(delete(Upload).where(Upload.game_id == game_id))
+    clean_segments = sorted(payload.segments, key=lambda item: (item.start_time, item.end_time))
+    for index, segment in enumerate(clean_segments, start=1):
+        if segment.end_time <= segment.start_time:
+            raise HTTPException(status_code=400, detail="Each segment end_time must be after start_time")
+        db.add(Upload(
+            game_id=game.id,
+            play_number=segment.play_number or index,
+            start_time=segment.start_time,
+            end_time=segment.end_time,
+            segment_confidence=1.0,
+            s3_url=game.s3_url,
+            foul_type="",
+            notes=segment.notes or "",
+            ruleset=game.ruleset,
+            timestamp=_now_utc(),
+            status="segmented",
+        ))
+    game.segment_count = len(clean_segments)
+    game.analyzed_count = 0
+    game.status = "segments_ready"
+    game.progress = 0.25
+    game.error_message = None
+    await db.commit()
+    return {"ok": True, "segment_count": len(clean_segments)}
+
+@app.post("/api/games/{game_id}/analyze")
+async def analyze_game(
+    game_id: int,
+    db: AsyncSession = Depends(get_db),
+    _auth: None = Depends(require_api_key),
+):
+    game_result = await db.execute(select(Game).where(Game.id == game_id))
+    game = game_result.scalar_one_or_none()
+    if not game:
+        raise HTTPException(status_code=404, detail="Game not found")
+    if game.status in {"queued_for_analysis", "analyzing"}:
+        return {"ok": True, "id": game_id, "status": game.status}
+    play_count_result = await db.execute(
+        select(func.count()).select_from(Upload).where(Upload.game_id == game_id)
+    )
+    if play_count_result.scalar_one() == 0:
+        raise HTTPException(status_code=409, detail="No play segments are available to analyze")
+    game.status = "queued_for_analysis"
+    game.progress = max(float(game.progress or 0), 0.25)
+    game.error_message = None
+    await db.commit()
+    asyncio.create_task(_analyze_game_bg(game_id))
+    return {"ok": True, "id": game_id, "status": "queued_for_analysis"}
+
 @app.post("/upload", response_model=UploadResponse)
 async def upload_video(
     file: UploadFile = File(...),
     foul_type: str = Form(...),
     notes: str = Form(""),
+    ruleset: str = Form("high_school"),
     db: AsyncSession = Depends(get_db),
     _auth: None = Depends(require_api_key),
 ):
     print("📥 Upload request received")
 
     try:
+        ruleset = _normalize_ruleset(ruleset)
         data = await file.read()
         print("✅ File read complete")
 
@@ -490,6 +1172,7 @@ async def upload_video(
                 s3_url=s3_url,
                 foul_type=foul_type,
                 notes=notes,
+                ruleset=ruleset,
                 timestamp=datetime.utcnow(),
                 status="queued",
             )
@@ -498,7 +1181,7 @@ async def upload_video(
             await db.refresh(rec)
             print("✅ DB write complete with ID:", rec.id)
 
-            asyncio.create_task(_process_upload_bg(rec.id, s3_url, foul_type, notes))
+            asyncio.create_task(_process_upload_bg(rec.id, s3_url, foul_type, notes, ruleset))
             response = UploadResponse(id=rec.id, s3_url=s3_url)
             print("✅ UploadResponse ready:", response.dict())
             return response
@@ -519,11 +1202,14 @@ async def list_recent_plays(
     status: Optional[str] = Query(None),
     reviewed: Optional[bool] = Query(None),
     q: Optional[str] = Query(None, min_length=1),
+    ruleset: str = Query("high_school"),
     db: AsyncSession = Depends(get_db),
     _auth: None = Depends(require_api_key),
 ):
     try:
+        ruleset = _normalize_ruleset(ruleset)
         filters = []
+        filters.append(Upload.ruleset == ruleset)
         if status:
             filters.append(Upload.status == status)
         if reviewed is not None:
@@ -565,10 +1251,17 @@ async def list_recent_plays(
                 official_agrees = r.human_label == r.prediction_label
             items.append({
                 "id": r.id,
+                "game_id": getattr(r, "game_id", None),
+                "play_number": getattr(r, "play_number", None),
+                "start_time": getattr(r, "start_time", None),
+                "end_time": getattr(r, "end_time", None),
+                "segment_confidence": getattr(r, "segment_confidence", None),
                 "foul_type": r.foul_type,
                 "notes": r.notes,
+                "ruleset": getattr(r, "ruleset", "high_school"),
                 "timestamp": r.timestamp.isoformat() if r.timestamp else None,
                 "status": r.status,
+                "result": getattr(r, "result", None),
                 "prediction_label": r.prediction_label,
                 "confidence": r.confidence,
                 "processed_at": r.processed_at.isoformat() if r.processed_at else None,
@@ -580,6 +1273,7 @@ async def list_recent_plays(
                 "reviewed_at": r.reviewed_at.isoformat() if getattr(r, "reviewed_at", None) else None,
                 "official_agrees": official_agrees,
                 "s3_url": r.s3_url,
+                "clip_s3_url": getattr(r, "clip_s3_url", None),
                 "presigned_url": presigned,
             })
         return {
@@ -617,7 +1311,13 @@ async def retry_upload(
     await db.commit()
 
     # Launch async background worker (non-blocking)
-    asyncio.create_task(_process_upload_bg(row.id, row.s3_url, row.foul_type, row.notes or ""))
+    asyncio.create_task(_process_upload_bg(
+        row.id,
+        row.s3_url,
+        row.foul_type,
+        row.notes or "",
+        getattr(row, "ruleset", "high_school") or "high_school",
+    ))
 
     return {"ok": True, "id": upload_id}
 
@@ -701,23 +1401,26 @@ def submit_official_feedback(
 async def search_rules(
     q: str = Query(..., min_length=2),
     k: int = Query(3, ge=1, le=10),
+    ruleset: str = Query("high_school"),
     _auth: None = Depends(require_api_key),
 ):
     """
     Simple retrieval endpoint to sanity-check embeddings & pgvector search.
     """
     try:
+        ruleset = _normalize_ruleset(ruleset)
         emb = await _embed_text(q)  # 3072-D
         qvec_literal = "[" + ",".join(f"{x:.6f}" for x in emb) + "]"
         sql = sqltext("""
             SELECT id, title, section, body,
                    1 - (embedding <=> (:qvec)::vector) AS score
             FROM rules
+            WHERE ruleset = :ruleset
             ORDER BY embedding <=> (:qvec)::vector
             LIMIT :k
         """)
         with engine.begin() as conn:
-            rows = conn.execute(sql, {"qvec": qvec_literal, "k": k}).mappings().all()
+            rows = conn.execute(sql, {"qvec": qvec_literal, "k": k, "ruleset": ruleset}).mappings().all()
         return [
             {
                 "id": int(r["id"]),

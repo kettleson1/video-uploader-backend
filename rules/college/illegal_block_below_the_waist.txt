@@ -1,0 +1,8 @@
+Ruleset: NCAA college football.
+Source basis: 2025 NCAA Football Rules and Interpretations, Rule 9, Section 1, Article 6 and related blocking definitions.
+
+Blocking below the waist is restricted in NCAA football and depends on the player's team, position, direction, zone, and timing. A block is suspect when a player initiates force below the waist outside permitted circumstances, especially from the side or back, toward the opponent's legs, or after the ball has left the blocking zone.
+
+Because NCAA low-block rules have detailed positional exceptions, a ruling should cite the exact alignment and play phase when available. If the clip does not show initial positions or direction clearly, mark the decision uncertain.
+
+Video keys: initial position at the snap, offensive or defensive player, contact point below waist, direction of force, ball location, play phase, and whether the block is from front, side, or back.

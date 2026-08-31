@@ -1,0 +1,8 @@
+Ruleset: NFL pro football.
+Source basis: 2025 NFL Official Playing Rules, Rule 12, Section 2, Article 12.
+
+Roughing or running into the kicker occurs when a defender illegally contacts a kicker or holder after a scrimmage kick. Roughing is more severe contact that endangers the kicker or holder, often involving the plant leg or force that knocks the player down. Running into is lesser contact that displaces the kicker without the same danger.
+
+No foul should be ruled when the defender touches the kick and unavoidable contact follows, or when the defender is blocked into the kicker.
+
+Video keys: whether the kick is touched, contact severity, plant-leg versus kicking-leg contact, whether a blocker caused the contact, and whether the kicker is endangered.
