@@ -62,6 +62,9 @@ OPENAI_EMBED_MODEL=text-embedding-3-large
 OPENAI_IMAGE_DETAIL=high
 CONFIDENCE_THRESHOLD=0.60
 CORS_ALLOWED_ORIGINS=https://www.davesystemsinc.com,https://davesystemsinc.com,http://localhost:3000
+PLAY_DETECTOR_MODE=coaches_activity_with_fallback
+LEGACY_GAME_SEGMENT_SECONDS=35
+LEGACY_GAME_SEGMENT_GAP_SECONDS=5
 ```
 
 `CORS_ALLOWED_ORIGINS` is a comma-separated list. If it is omitted, the backend allows the DAVE production domains and `http://localhost:3000` for local development.
@@ -143,6 +146,21 @@ http://localhost:8000/api/docs
 | `/api/plays/{upload_id}/feedback` | POST | Save official agree/disagree feedback |
 | `/api/review/{upload_id}` | POST | Save human review and optional prediction override |
 | `/api/plays/{upload_id}/review` | PATCH | Save or clear human review data |
+| `/api/games/{game_id}/timeline` | GET | Return migrated plays, findings, and processing-job state for a full game |
+
+## Full-Game Compatibility Migration
+
+Backend startup creates the additive `plays`, `play_findings`, and
+`processing_jobs` tables and backfills existing batch uploads without changing or
+deleting rows in `uploads`. Existing single-play and batch APIs continue to use
+the legacy fields while the timeline API exposes the new model.
+
+`PLAY_DETECTOR_MODE` supports:
+
+- `coaches_activity_with_fallback` (default): use coaches-film activity detection
+  and fall back to legacy fixed windows when no candidates are found.
+- `coaches_activity`: use only the new detector and surface detection failures.
+- `fixed_window`: use the retained legacy segmentation path.
 
 ## Upload Flow
 
