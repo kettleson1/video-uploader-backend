@@ -32,6 +32,7 @@ class FullGameModelContractTests(unittest.TestCase):
             "legacy_upload_id", "source_start_time",
             "detection_confidence", "analysis_status", "snap_time",
             "live_ball_end_time", "boundary_flags", "analysis_revision",
+            "original_start_time", "original_end_time", "boundary_correction_count",
         } <= model_columns("Play"))
 
     def test_findings_support_multiple_rulings_per_play(self):
@@ -44,6 +45,13 @@ class FullGameModelContractTests(unittest.TestCase):
         self.assertTrue({
             "job_key", "stage", "attempts", "max_attempts", "available_at",
         } <= model_columns("ProcessingJob"))
+
+    def test_shadow_comparisons_are_durable_and_game_scoped(self):
+        self.assertTrue({
+            "game_id", "selected_method", "legacy_count", "play_first_count",
+            "matched_count", "unmatched_legacy_count",
+            "unmatched_play_first_count", "legacy_candidates", "play_first_candidates",
+        } <= model_columns("SegmentationComparison"))
 
 
 if __name__ == "__main__":

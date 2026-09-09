@@ -62,7 +62,8 @@ OPENAI_EMBED_MODEL=text-embedding-3-large
 OPENAI_IMAGE_DETAIL=high
 CONFIDENCE_THRESHOLD=0.60
 CORS_ALLOWED_ORIGINS=https://www.davesystemsinc.com,https://davesystemsinc.com,http://localhost:3000
-PLAY_DETECTOR_MODE=coaches_activity_with_fallback
+PLAY_DETECTOR_MODE=shadow_compare
+PLAY_FIRST_ACCEPTED=false
 LEGACY_GAME_SEGMENT_SECONDS=35
 LEGACY_GAME_SEGMENT_GAP_SECONDS=5
 FULL_GAME_WORKER_CONCURRENCY=4
@@ -152,6 +153,8 @@ http://localhost:8000/api/docs
 | `/api/review/{upload_id}` | POST | Save human review and optional prediction override |
 | `/api/plays/{upload_id}/review` | PATCH | Save or clear human review data |
 | `/api/games/{game_id}/timeline` | GET | Return migrated plays, findings, and processing-job state for a full game |
+| `/api/games/{game_id}/segmentation-comparison` | GET | Return fixed-window/play-first overlap and human-correction metrics |
+| `/api/migration/readiness` | GET | Audit migration integrity and legacy-retirement blockers |
 | `/api/play-findings/{finding_id}/review` | PATCH | Agree with, correct, dismiss, or clear review of one foul finding |
 | `/api/plays/{play_id}/findings` | POST | Add an official finding to a full-game play |
 | `/api/games/{game_id}/plays/{play_id}/boundary` | PATCH | Adjust one play boundary and queue selective re-analysis |
@@ -167,17 +170,31 @@ administration, and disqualification remain outside the AI finding schema.
 
 ## Full-Game Compatibility Migration
 
-Backend startup creates the additive `plays`, `play_findings`, and
-`processing_jobs` tables and backfills existing batch uploads without changing or
-deleting rows in `uploads`. Existing single-play and batch APIs continue to use
-the legacy fields while the timeline API exposes the new model.
+Backend startup creates the additive `plays`, `play_findings`,
+`processing_jobs`, and `segmentation_comparisons` tables and backfills existing
+batch uploads without changing or deleting rows in `uploads`. Existing
+single-play and batch APIs continue to use the legacy fields while the timeline
+API exposes the new model.
 
 `PLAY_DETECTOR_MODE` supports:
 
-- `coaches_activity_with_fallback` (default): use coaches-film activity detection
+- `shadow_compare` (default): run both detectors, persist candidates and overlap
+  metrics, and continue selecting fixed windows until `PLAY_FIRST_ACCEPTED=true`.
+- `coaches_activity_with_fallback`: use coaches-film activity detection
   and fall back to legacy fixed windows when no candidates are found.
 - `coaches_activity`: use only the new detector and surface detection failures.
 - `fixed_window`: use the retained legacy segmentation path.
+
+Fixed-window comparisons are a baseline, not labeled ground truth. The API calls
+non-overlapping candidates `unmatched`; it does not call them missed plays. Once
+an official edits a timeline, correction counts and total boundary movement are
+reported separately. Elapsed time to the first correction is available as an
+operational proxy, but is not active review labor time.
+
+Promote play-first detection only after reviewed test games meet the team's
+acceptance targets, then set `PLAY_FIRST_ACCEPTED=true` while retaining
+`fixed_window` for one release. `/api/migration/readiness` deliberately keeps
+`ready_to_remove_legacy` false until that release and rollback check are complete.
 
 ## Full-Game Worker
 

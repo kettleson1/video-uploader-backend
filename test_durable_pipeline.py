@@ -55,6 +55,15 @@ class DurablePipelineContractTests(unittest.TestCase):
             self.assertIn(route, source)
         self.assertIn("analysis_revision", source)
 
+    def test_shadow_migration_controls_remain_reversible(self):
+        source = (BACKEND_DIR / "main.py").read_text()
+        worker = (BACKEND_DIR / "full_game_worker.py").read_text()
+        self.assertIn('os.getenv("PLAY_DETECTOR_MODE", "shadow_compare")', source)
+        self.assertIn("PLAY_FIRST_ACCEPTED", source)
+        self.assertIn("_detect_play_segments_fixed_window", source)
+        self.assertIn("SegmentationComparison", worker)
+        self.assertIn('@app.get("/api/migration/readiness")', source)
+
 
 if __name__ == "__main__":
     unittest.main()

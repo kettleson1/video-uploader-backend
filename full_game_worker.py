@@ -24,7 +24,7 @@ from job_queue import (
 )
 from main import (
     BUCKET_NAME,
-    _detect_play_segments,
+    _detect_play_segments_with_comparison,
     _extract_clip_bytes,
     _extract_frames,
     _predict_batch_with_rules,
@@ -36,7 +36,7 @@ from main import (
     ensure_ruleset_columns,
     s3_client,
 )
-from models import Game, Play, PlayFinding, ProcessingJob, Upload
+from models import Game, Play, PlayFinding, ProcessingJob, SegmentationComparison, Upload
 
 
 WORKER_CONCURRENCY = max(1, int(os.getenv("FULL_GAME_WORKER_CONCURRENCY", "4")))
@@ -133,9 +133,35 @@ async def handle_detect_plays(job: ProcessingJob):
         game.progress = 0.08
         await db.commit()
         video_bytes = await read_s3(game.s3_url)
-        segments = await asyncio.to_thread(_detect_play_segments, video_bytes)
+        segments, comparison = await asyncio.to_thread(
+            _detect_play_segments_with_comparison, video_bytes
+        )
         if not segments:
             raise RuntimeError("No playable segments could be detected")
+
+        if comparison:
+            comparison_result = await db.execute(
+                select(SegmentationComparison).where(
+                    SegmentationComparison.game_id == game.id
+                )
+            )
+            comparison_row = comparison_result.scalar_one_or_none()
+            if not comparison_row:
+                comparison_row = SegmentationComparison(
+                    game_id=game.id,
+                    created_at=now_utc(),
+                )
+                db.add(comparison_row)
+            for field in (
+                "detector_mode", "selected_method", "legacy_count", "play_first_count",
+                "matched_count", "unmatched_legacy_count", "unmatched_play_first_count",
+                "possible_duplicate_play_first_count", "mean_matched_iou",
+                "match_iou_threshold", "legacy_candidates", "play_first_candidates",
+                "detector_error",
+            ):
+                setattr(comparison_row, field, comparison[field])
+            comparison_row.play_first_accepted = comparison["play_first_accepted"]
+            comparison_row.updated_at = now_utc()
 
         for segment in segments:
             upload = Upload(
@@ -159,15 +185,13 @@ async def handle_detect_plays(job: ProcessingJob):
                 play_number=upload.play_number,
                 source_start_time=upload.start_time,
                 source_end_time=upload.end_time,
+                original_start_time=upload.start_time,
+                original_end_time=upload.end_time,
                 snap_time=segment.get("snap_time"),
                 live_ball_end_time=segment.get("live_ball_end_time"),
                 clip_start_time=upload.start_time,
                 clip_end_time=upload.end_time,
-                detection_method=(
-                    "legacy_fixed_window"
-                    if upload.segment_confidence == 0.35
-                    else "coaches_activity"
-                ),
+                detection_method=segment.get("detection_method", "coaches_activity"),
                 detection_confidence=upload.segment_confidence,
                 boundary_flags=segment.get("boundary_flags") or [],
                 boundary_review_status="unreviewed",

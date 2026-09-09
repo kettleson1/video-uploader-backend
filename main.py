@@ -11,7 +11,7 @@ import secrets
 import time
 from datetime import datetime, timezone
 from typing import List, Optional
-from models import Game, Play, PlayFinding, ProcessingJob, Upload, Rule
+from models import Game, Play, PlayFinding, ProcessingJob, SegmentationComparison, Upload, Rule
 from coaches_film_detector import (
     detect_play_boundaries,
     extract_activity_samples,
@@ -19,6 +19,7 @@ from coaches_film_detector import (
 )
 from job_queue import enqueue_job
 from foul_findings import normalize_findings_payload
+from segmentation_comparison import compare_segmentations
 
 import boto3
 from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, Query, Body, HTTPException, Depends, Header
@@ -59,7 +60,8 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_EMBED_MODEL = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-large")  # 3072-D
 CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.60"))
-PLAY_DETECTOR_MODE = os.getenv("PLAY_DETECTOR_MODE", "coaches_activity_with_fallback")
+PLAY_DETECTOR_MODE = os.getenv("PLAY_DETECTOR_MODE", "shadow_compare")
+PLAY_FIRST_ACCEPTED = os.getenv("PLAY_FIRST_ACCEPTED", "false").strip().lower() in {"1", "true", "yes"}
 LEGACY_GAME_SEGMENT_SECONDS = float(os.getenv("LEGACY_GAME_SEGMENT_SECONDS", "35"))
 LEGACY_GAME_SEGMENT_GAP_SECONDS = float(os.getenv("LEGACY_GAME_SEGMENT_GAP_SECONDS", "5"))
 DAVE_API_KEY = os.getenv("DAVE_API_KEY")
@@ -178,6 +180,13 @@ def ensure_ruleset_columns():
         conn.execute(sqltext("ALTER TABLE IF EXISTS plays ADD COLUMN IF NOT EXISTS retrieved_rules JSONB"))
         conn.execute(sqltext("ALTER TABLE IF EXISTS plays ADD COLUMN IF NOT EXISTS analysis_payload JSONB"))
         conn.execute(sqltext("ALTER TABLE IF EXISTS plays ADD COLUMN IF NOT EXISTS analysis_revision INTEGER DEFAULT 0"))
+        conn.execute(sqltext("ALTER TABLE IF EXISTS plays ADD COLUMN IF NOT EXISTS original_start_time DOUBLE PRECISION"))
+        conn.execute(sqltext("ALTER TABLE IF EXISTS plays ADD COLUMN IF NOT EXISTS original_end_time DOUBLE PRECISION"))
+        conn.execute(sqltext("ALTER TABLE IF EXISTS plays ADD COLUMN IF NOT EXISTS boundary_correction_count INTEGER DEFAULT 0"))
+        conn.execute(sqltext("ALTER TABLE IF EXISTS plays ADD COLUMN IF NOT EXISTS boundary_first_reviewed_at TIMESTAMP"))
+        conn.execute(sqltext("ALTER TABLE IF EXISTS plays ADD COLUMN IF NOT EXISTS boundary_last_reviewed_at TIMESTAMP"))
+        conn.execute(sqltext("UPDATE plays SET original_start_time = source_start_time WHERE original_start_time IS NULL"))
+        conn.execute(sqltext("UPDATE plays SET original_end_time = source_end_time WHERE original_end_time IS NULL"))
         conn.execute(sqltext("CREATE INDEX IF NOT EXISTS ix_plays_game_id ON plays (game_id)"))
         conn.execute(sqltext("CREATE UNIQUE INDEX IF NOT EXISTS ix_plays_legacy_upload_id ON plays (legacy_upload_id)"))
         conn.execute(sqltext("""
@@ -275,6 +284,29 @@ def ensure_ruleset_columns():
         conn.execute(sqltext("ALTER TABLE IF EXISTS processing_jobs ALTER COLUMN job_key SET NOT NULL"))
         conn.execute(sqltext("CREATE INDEX IF NOT EXISTS ix_processing_jobs_game_id ON processing_jobs (game_id)"))
         conn.execute(sqltext("CREATE INDEX IF NOT EXISTS ix_processing_jobs_play_id ON processing_jobs (play_id)"))
+        conn.execute(sqltext("""
+            CREATE TABLE IF NOT EXISTS segmentation_comparisons (
+                id BIGSERIAL PRIMARY KEY,
+                game_id BIGINT NOT NULL UNIQUE,
+                detector_mode TEXT NOT NULL,
+                selected_method TEXT NOT NULL,
+                play_first_accepted BOOLEAN NOT NULL DEFAULT FALSE,
+                legacy_count INTEGER NOT NULL DEFAULT 0,
+                play_first_count INTEGER NOT NULL DEFAULT 0,
+                matched_count INTEGER NOT NULL DEFAULT 0,
+                unmatched_legacy_count INTEGER NOT NULL DEFAULT 0,
+                unmatched_play_first_count INTEGER NOT NULL DEFAULT 0,
+                possible_duplicate_play_first_count INTEGER NOT NULL DEFAULT 0,
+                mean_matched_iou DOUBLE PRECISION DEFAULT 0,
+                match_iou_threshold DOUBLE PRECISION DEFAULT 0.30,
+                legacy_candidates JSONB,
+                play_first_candidates JSONB,
+                detector_error TEXT,
+                created_at TIMESTAMP,
+                updated_at TIMESTAMP
+            )
+        """))
+        conn.execute(sqltext("CREATE UNIQUE INDEX IF NOT EXISTS ix_segmentation_comparisons_game_id ON segmentation_comparisons (game_id)"))
 
 # Dependency to get the database session
 async def get_db():
@@ -599,21 +631,53 @@ def _detect_play_segments(video_bytes: bytes) -> List[dict]:
     """
     Detect editable play candidates from continuous coaches film.
     """
+    return _detect_play_segments_with_comparison(video_bytes)[0]
+
+
+def _detect_play_segments_with_comparison(video_bytes: bytes):
+    """Detect candidates and return the optional legacy/play-first comparison."""
     duration = _probe_video_duration(video_bytes)
     if duration <= 0:
-        return []
+        return [], None
+    legacy = _detect_play_segments_fixed_window(duration)
     if PLAY_DETECTOR_MODE == "fixed_window":
-        return _detect_play_segments_fixed_window(duration)
+        return legacy, None
+    detector_error = None
     try:
         samples = extract_activity_samples(video_bytes)
-        segments = detect_play_boundaries(samples, duration)
-    except Exception:
-        if PLAY_DETECTOR_MODE != "coaches_activity_with_fallback":
+        play_first = detect_play_boundaries(samples, duration)
+    except Exception as error:
+        if PLAY_DETECTOR_MODE not in {"coaches_activity_with_fallback", "shadow_compare"}:
             raise
-        segments = []
-    if segments or PLAY_DETECTOR_MODE != "coaches_activity_with_fallback":
-        return segments
-    return _detect_play_segments_fixed_window(duration)
+        play_first = []
+        detector_error = _safe_err_text(error)
+
+    if PLAY_DETECTOR_MODE == "shadow_compare":
+        metrics = compare_segmentations(legacy, play_first)
+        selected_method = (
+            "coaches_activity" if PLAY_FIRST_ACCEPTED and play_first else "legacy_fixed_window"
+        )
+        selected = play_first if selected_method == "coaches_activity" else legacy
+        for candidate in selected:
+            candidate["detection_method"] = selected_method
+        comparison = {
+            **metrics,
+            "detector_mode": PLAY_DETECTOR_MODE,
+            "selected_method": selected_method,
+            "play_first_accepted": PLAY_FIRST_ACCEPTED,
+            "legacy_candidates": legacy,
+            "play_first_candidates": play_first,
+            "detector_error": detector_error,
+        }
+        return selected, comparison
+
+    if play_first or PLAY_DETECTOR_MODE != "coaches_activity_with_fallback":
+        for candidate in play_first:
+            candidate["detection_method"] = "coaches_activity"
+        return play_first, None
+    for candidate in legacy:
+        candidate["detection_method"] = "legacy_fixed_window"
+    return legacy, None
 
 
 def _detect_play_segments_fixed_window(duration: float) -> List[dict]:
@@ -1149,15 +1213,13 @@ async def _segment_game_bg(game_id: int):
                     play_number=upload.play_number,
                     source_start_time=upload.start_time,
                     source_end_time=upload.end_time,
+                    original_start_time=upload.start_time,
+                    original_end_time=upload.end_time,
                     snap_time=segment.get("snap_time"),
                     live_ball_end_time=segment.get("live_ball_end_time"),
                     clip_start_time=upload.start_time,
                     clip_end_time=upload.end_time,
-                    detection_method=(
-                        "legacy_fixed_window"
-                        if upload.segment_confidence == 0.35
-                        else "coaches_activity"
-                    ),
+                    detection_method=segment.get("detection_method", "coaches_activity"),
                     detection_confidence=upload.segment_confidence,
                     boundary_flags=segment.get("boundary_flags") or [],
                     boundary_review_status="unreviewed",
@@ -1452,6 +1514,124 @@ async def list_games(
         "offset": offset,
     }
 
+
+@app.get("/api/migration/readiness")
+async def get_migration_readiness(
+    db: AsyncSession = Depends(get_db),
+    _auth: None = Depends(require_api_key),
+):
+    game_count = await db.scalar(select(func.count()).select_from(Game)) or 0
+    comparison_count = await db.scalar(
+        select(func.count()).select_from(SegmentationComparison)
+    ) or 0
+    unmigrated_batch_uploads = await db.scalar(
+        select(func.count()).select_from(Upload).where(
+            Upload.game_id.isnot(None),
+            ~Upload.id.in_(select(Play.legacy_upload_id).where(Play.legacy_upload_id.isnot(None))),
+        )
+    ) or 0
+    games_without_plays = await db.scalar(
+        select(func.count()).select_from(Game).where(
+            ~Game.id.in_(select(Play.game_id))
+        )
+    ) or 0
+    orphan_findings = await db.scalar(
+        select(func.count()).select_from(PlayFinding).where(
+            ~PlayFinding.play_id.in_(select(Play.id))
+        )
+    ) or 0
+    orphan_jobs = await db.scalar(
+        select(func.count()).select_from(ProcessingJob).where(
+            ~ProcessingJob.game_id.in_(select(Game.id))
+        )
+    ) or 0
+    integrity_ready = not any((
+        unmigrated_batch_uploads, games_without_plays, orphan_findings, orphan_jobs,
+    ))
+    return {
+        "detector_mode": PLAY_DETECTOR_MODE,
+        "play_first_accepted": PLAY_FIRST_ACCEPTED,
+        "legacy_fallback_available": True,
+        "game_count": game_count,
+        "comparison_game_count": comparison_count,
+        "unmigrated_batch_upload_count": unmigrated_batch_uploads,
+        "games_without_plays_count": games_without_plays,
+        "orphan_finding_count": orphan_findings,
+        "orphan_job_count": orphan_jobs,
+        "existing_games_readable_through_new_model": integrity_ready,
+        "ready_to_make_play_first_default": bool(
+            PLAY_FIRST_ACCEPTED and comparison_count > 0 and integrity_ready
+        ),
+        "ready_to_remove_legacy": False,
+        "legacy_removal_blockers": [
+            "retain the administrative fallback for one accepted release",
+            "verify rollback is no longer required",
+        ],
+    }
+
+
+@app.get("/api/games/{game_id}/segmentation-comparison")
+async def get_game_segmentation_comparison(
+    game_id: int,
+    db: AsyncSession = Depends(get_db),
+    _auth: None = Depends(require_api_key),
+):
+    game = await db.get(Game, game_id)
+    if not game:
+        raise HTTPException(status_code=404, detail="Game not found")
+    comparison_result = await db.execute(
+        select(SegmentationComparison).where(SegmentationComparison.game_id == game_id)
+    )
+    comparison = comparison_result.scalar_one_or_none()
+    plays_result = await db.execute(select(Play).where(Play.game_id == game_id))
+    plays = plays_result.scalars().all()
+    corrected = [play for play in plays if int(play.boundary_correction_count or 0) > 0]
+    boundary_delta_seconds = sum(
+        abs(float(play.source_start_time) - float(play.original_start_time))
+        + abs(float(play.source_end_time) - float(play.original_end_time))
+        for play in corrected
+        if play.original_start_time is not None and play.original_end_time is not None
+    )
+    first_review = min(
+        [play.boundary_first_reviewed_at for play in corrected if play.boundary_first_reviewed_at]
+        or [None]
+    )
+    correction_latency_seconds = (
+        max(0.0, (first_review - game.segmented_at).total_seconds())
+        if first_review and game.segmented_at else None
+    )
+    baseline = None if not comparison else {
+        "detector_mode": comparison.detector_mode,
+        "selected_method": comparison.selected_method,
+        "play_first_accepted": bool(comparison.play_first_accepted),
+        "legacy_count": comparison.legacy_count,
+        "play_first_count": comparison.play_first_count,
+        "count_delta": comparison.play_first_count - comparison.legacy_count,
+        "matched_count": comparison.matched_count,
+        "unmatched_legacy_count": comparison.unmatched_legacy_count,
+        "unmatched_play_first_count": comparison.unmatched_play_first_count,
+        "possible_duplicate_play_first_count": comparison.possible_duplicate_play_first_count,
+        "mean_matched_iou": comparison.mean_matched_iou,
+        "match_iou_threshold": comparison.match_iou_threshold,
+        "detector_error": comparison.detector_error,
+        "legacy_candidates": comparison.legacy_candidates or [],
+        "play_first_candidates": comparison.play_first_candidates or [],
+    }
+    return {
+        "game_id": game_id,
+        "baseline_comparison": baseline,
+        "human_corrected_timeline": {
+            "current_play_count": len(plays),
+            "corrected_play_count": len(corrected),
+            "boundary_correction_count": sum(
+                int(play.boundary_correction_count or 0) for play in plays
+            ),
+            "total_boundary_adjustment_seconds": round(boundary_delta_seconds, 2),
+            "seconds_to_first_correction": correction_latency_seconds,
+            "note": "Latency is elapsed time, not active official review time.",
+        },
+    }
+
 @app.get("/api/games/{game_id}")
 async def get_game(
     game_id: int,
@@ -1572,6 +1752,11 @@ async def get_game_timeline(
             "detection_confidence": play.detection_confidence,
             "boundary_flags": play.boundary_flags or [],
             "boundary_review_status": play.boundary_review_status,
+            "original_start_time": play.original_start_time,
+            "original_end_time": play.original_end_time,
+            "boundary_correction_count": play.boundary_correction_count or 0,
+            "boundary_first_reviewed_at": play.boundary_first_reviewed_at,
+            "boundary_last_reviewed_at": play.boundary_last_reviewed_at,
             "analysis_status": play.analysis_status,
             "analysis_version": play.analysis_version,
             "analysis_revision": play.analysis_revision or 0,
@@ -1664,6 +1849,8 @@ async def update_game_segments(
             play_number=upload.play_number,
             source_start_time=upload.start_time,
             source_end_time=upload.end_time,
+            original_start_time=upload.start_time,
+            original_end_time=upload.end_time,
             snap_time=None,
             live_ball_end_time=None,
             clip_start_time=upload.start_time,
@@ -1763,6 +1950,14 @@ async def update_play_boundary(
         raise HTTPException(status_code=400, detail="End time must be after a non-negative start time")
     if game.source_duration and payload.end_time > game.source_duration:
         raise HTTPException(status_code=400, detail="Boundary exceeds the source video duration")
+    reviewed_at = _now_utc()
+    if play.original_start_time is None:
+        play.original_start_time = play.source_start_time
+    if play.original_end_time is None:
+        play.original_end_time = play.source_end_time
+    play.boundary_correction_count = int(play.boundary_correction_count or 0) + 1
+    play.boundary_first_reviewed_at = play.boundary_first_reviewed_at or reviewed_at
+    play.boundary_last_reviewed_at = reviewed_at
     play.source_start_time = payload.start_time
     play.source_end_time = payload.end_time
     play.clip_start_time = payload.start_time
@@ -1809,6 +2004,14 @@ async def split_game_play(
         if later_upload:
             later_upload.play_number = later.play_number
     original_end = play.source_end_time
+    reviewed_at = _now_utc()
+    if play.original_start_time is None:
+        play.original_start_time = play.source_start_time
+    if play.original_end_time is None:
+        play.original_end_time = play.source_end_time
+    play.boundary_correction_count = int(play.boundary_correction_count or 0) + 1
+    play.boundary_first_reviewed_at = play.boundary_first_reviewed_at or reviewed_at
+    play.boundary_last_reviewed_at = reviewed_at
     original_upload = await db.get(Upload, play.legacy_upload_id)
     play.source_end_time = payload.split_time
     play.clip_end_time = payload.split_time
@@ -1836,6 +2039,11 @@ async def split_game_play(
         play_number=new_upload.play_number,
         source_start_time=payload.split_time,
         source_end_time=original_end,
+        original_start_time=payload.split_time,
+        original_end_time=original_end,
+        boundary_correction_count=1,
+        boundary_first_reviewed_at=reviewed_at,
+        boundary_last_reviewed_at=reviewed_at,
         clip_start_time=payload.split_time,
         clip_end_time=original_end,
         detection_method="human_split",
@@ -1872,6 +2080,14 @@ async def merge_game_plays(
     _assert_game_editable(game)
     if next_play.play_number != play.play_number + 1:
         raise HTTPException(status_code=400, detail="Only consecutive plays can be merged")
+    reviewed_at = _now_utc()
+    if play.original_start_time is None:
+        play.original_start_time = play.source_start_time
+    if play.original_end_time is None:
+        play.original_end_time = play.source_end_time
+    play.boundary_correction_count = int(play.boundary_correction_count or 0) + 1
+    play.boundary_first_reviewed_at = play.boundary_first_reviewed_at or reviewed_at
+    play.boundary_last_reviewed_at = reviewed_at
     play.source_end_time = max(play.source_end_time, next_play.source_end_time)
     play.clip_end_time = play.source_end_time
     play.detection_method = "human_merge"

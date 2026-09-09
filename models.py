@@ -1,4 +1,4 @@
-from sqlalchemy import Column, BigInteger, Text, Float, DateTime, Integer, String
+from sqlalchemy import Column, BigInteger, Text, Float, DateTime, Integer, String, Boolean
 from sqlalchemy.dialects.postgresql import JSONB
 from database import Base   # ✅ Base correctly imported from db setup
 
@@ -89,6 +89,11 @@ class Play(Base):
     detection_confidence = Column(Float)
     boundary_flags = Column(JSONB)
     boundary_review_status = Column(Text, default="unreviewed")
+    original_start_time = Column(Float)
+    original_end_time = Column(Float)
+    boundary_correction_count = Column(Integer, default=0)
+    boundary_first_reviewed_at = Column(DateTime)
+    boundary_last_reviewed_at = Column(DateTime)
     analysis_status = Column(Text, default="pending")
     analysis_version = Column(Text)
     analysis_revision = Column(Integer, default=0)
@@ -147,5 +152,28 @@ class ProcessingJob(Base):
     available_at = Column(DateTime)
     started_at = Column(DateTime)
     finished_at = Column(DateTime)
+    created_at = Column(DateTime)
+    updated_at = Column(DateTime)
+
+
+class SegmentationComparison(Base):
+    __tablename__ = "segmentation_comparisons"
+
+    id = Column(BigInteger, primary_key=True)
+    game_id = Column(BigInteger, nullable=False, unique=True, index=True)
+    detector_mode = Column(Text, nullable=False)
+    selected_method = Column(Text, nullable=False)
+    play_first_accepted = Column(Boolean, nullable=False, default=False)
+    legacy_count = Column(Integer, nullable=False, default=0)
+    play_first_count = Column(Integer, nullable=False, default=0)
+    matched_count = Column(Integer, nullable=False, default=0)
+    unmatched_legacy_count = Column(Integer, nullable=False, default=0)
+    unmatched_play_first_count = Column(Integer, nullable=False, default=0)
+    possible_duplicate_play_first_count = Column(Integer, nullable=False, default=0)
+    mean_matched_iou = Column(Float, default=0.0)
+    match_iou_threshold = Column(Float, default=0.30)
+    legacy_candidates = Column(JSONB)
+    play_first_candidates = Column(JSONB)
+    detector_error = Column(Text)
     created_at = Column(DateTime)
     updated_at = Column(DateTime)

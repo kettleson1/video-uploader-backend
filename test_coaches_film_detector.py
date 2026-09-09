@@ -5,6 +5,7 @@ from coaches_film_detector import (
     detect_play_boundaries,
     find_uncovered_intervals,
 )
+from segmentation_comparison import compare_segmentations, interval_iou
 
 
 def samples(scores, interval=0.5):
@@ -71,6 +72,26 @@ class DetectPlayBoundariesTests(unittest.TestCase):
             {"start_time": 12.0, "end_time": 15.0},
             {"start_time": 18.0, "end_time": 20.0},
         ])
+
+    def test_compares_shadow_candidates_without_calling_either_ground_truth(self):
+        legacy = [
+            {"start_time": 0.0, "end_time": 10.0},
+            {"start_time": 15.0, "end_time": 25.0},
+        ]
+        play_first = [
+            {"start_time": 1.0, "end_time": 9.0},
+            {"start_time": 16.0, "end_time": 20.0},
+            {"start_time": 21.0, "end_time": 24.0},
+            {"start_time": 30.0, "end_time": 35.0},
+        ]
+
+        result = compare_segmentations(legacy, play_first, match_iou=0.25)
+
+        self.assertAlmostEqual(interval_iou(legacy[0], play_first[0]), 0.8)
+        self.assertEqual(result["matched_count"], 2)
+        self.assertEqual(result["unmatched_play_first_count"], 2)
+        self.assertEqual(result["possible_duplicate_play_first_count"], 1)
+        self.assertNotIn("missed_play_count", result)
 
 
 if __name__ == "__main__":
