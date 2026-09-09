@@ -157,6 +157,7 @@ def ensure_ruleset_columns():
                 boundary_review_status TEXT DEFAULT 'unreviewed',
                 analysis_status TEXT DEFAULT 'pending',
                 analysis_version TEXT,
+                analysis_revision INTEGER DEFAULT 0,
                 broad_screen TEXT,
                 retrieved_rules JSONB,
                 analysis_payload JSONB,
@@ -176,6 +177,7 @@ def ensure_ruleset_columns():
         conn.execute(sqltext("ALTER TABLE IF EXISTS plays ADD COLUMN IF NOT EXISTS broad_screen TEXT"))
         conn.execute(sqltext("ALTER TABLE IF EXISTS plays ADD COLUMN IF NOT EXISTS retrieved_rules JSONB"))
         conn.execute(sqltext("ALTER TABLE IF EXISTS plays ADD COLUMN IF NOT EXISTS analysis_payload JSONB"))
+        conn.execute(sqltext("ALTER TABLE IF EXISTS plays ADD COLUMN IF NOT EXISTS analysis_revision INTEGER DEFAULT 0"))
         conn.execute(sqltext("CREATE INDEX IF NOT EXISTS ix_plays_game_id ON plays (game_id)"))
         conn.execute(sqltext("CREATE UNIQUE INDEX IF NOT EXISTS ix_plays_legacy_upload_id ON plays (legacy_upload_id)"))
         conn.execute(sqltext("""
@@ -380,6 +382,17 @@ class ManualFindingPayload(BaseModel):
     rule_citations: List[str] = Field(default_factory=list)
     uncertainty_notes: Optional[str] = None
 
+class PlayBoundaryPayload(BaseModel):
+    start_time: float
+    end_time: float
+    notes: Optional[str] = None
+
+class PlaySplitPayload(BaseModel):
+    split_time: float
+
+class PlayMergePayload(BaseModel):
+    next_play_id: int
+
 # ------------------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------------------
@@ -428,6 +441,64 @@ def _finding_to_dict(finding: PlayFinding) -> dict:
         "reviewed_at": finding.reviewed_at.isoformat() if finding.reviewed_at else None,
         "created_by": finding.created_by or "ai",
     }
+
+async def _reset_play_for_reanalysis(db: AsyncSession, play: Play, clear_clip: bool = False):
+    play.analysis_revision = int(play.analysis_revision or 0) + 1
+    play.analysis_status = "queued_for_reanalysis"
+    play.analysis_version = None
+    play.broad_screen = None
+    play.retrieved_rules = None
+    play.analysis_payload = None
+    play.result = None
+    play.prediction_label = None
+    play.confidence = None
+    play.error_message = None
+    play.analyzed_at = None
+    play.updated_at = _now_utc()
+    if clear_clip:
+        play.clip_s3_url = None
+    await db.execute(delete(PlayFinding).where(PlayFinding.play_id == play.id))
+    upload = await db.get(Upload, play.legacy_upload_id)
+    if upload:
+        upload.status = "segmented"
+        upload.result = None
+        upload.prediction_label = None
+        upload.confidence = None
+        upload.error_message = None
+        upload.explanation = None
+        upload.retrieved_rules = None
+        upload.processed_at = None
+        if clear_clip:
+            upload.clip_s3_url = None
+            game = await db.get(Game, play.game_id)
+            if game:
+                upload.s3_url = game.s3_url
+
+async def _enqueue_selective_analysis(db: AsyncSession, game: Game):
+    signature_result = await db.execute(
+        select(Play.id, Play.source_start_time, Play.source_end_time, Play.analysis_revision)
+        .where(Play.game_id == game.id)
+        .order_by(Play.play_number, Play.id)
+    )
+    signature = hashlib.sha256(json.dumps([
+        [row.id, row.source_start_time, row.source_end_time, row.analysis_revision]
+        for row in signature_result.all()
+    ]).encode("utf-8")).hexdigest()[:16]
+    await enqueue_job(
+        db,
+        job_key=f"game:{game.id}:extract_clips:selective:{signature}",
+        game_id=game.id,
+        stage="extract_clips",
+    )
+    game.status = "queued_for_analysis"
+    game.error_message = None
+
+def _assert_game_editable(game: Game):
+    if game.status in {
+        "queued_for_analysis", "extracting_clips", "analyzing",
+        "screening", "retrieving_rules", "focused_analysis",
+    }:
+        raise HTTPException(status_code=409, detail="Play boundaries cannot change while analysis is running")
 
 def _s3_key_from_url(url: str) -> str:
     # https://bucket.s3.region.amazonaws.com/<key>
@@ -1468,6 +1539,13 @@ async def get_game_timeline(
         )
         for finding in findings_result.scalars().all():
             findings_by_play[finding.play_id].append(_finding_to_dict(finding))
+    upload_ids = [play.legacy_upload_id for play in plays if play.legacy_upload_id]
+    reviewed_upload_ids = set()
+    if upload_ids:
+        reviewed_result = await db.execute(
+            select(Upload.id).where(Upload.id.in_(upload_ids), Upload.reviewed_at.isnot(None))
+        )
+        reviewed_upload_ids = set(reviewed_result.scalars().all())
     jobs_result = await db.execute(
         select(ProcessingJob)
         .where(ProcessingJob.game_id == game_id)
@@ -1486,18 +1564,39 @@ async def get_game_timeline(
             "clip_start_time": play.clip_start_time,
             "clip_end_time": play.clip_end_time,
             "clip_s3_url": play.clip_s3_url,
+            "presigned_url": (
+                _presign(_s3_key_from_url(play.clip_s3_url), 3600)
+                if play.clip_s3_url else None
+            ),
             "detection_method": play.detection_method,
             "detection_confidence": play.detection_confidence,
             "boundary_flags": play.boundary_flags or [],
             "boundary_review_status": play.boundary_review_status,
             "analysis_status": play.analysis_status,
             "analysis_version": play.analysis_version,
+            "analysis_revision": play.analysis_revision or 0,
             "result": play.result,
             "prediction_label": play.prediction_label,
             "confidence": play.confidence,
             "notes": play.notes,
             "error_message": play.error_message,
             "findings": findings_by_play[play.id],
+            "finding_count": len(findings_by_play[play.id]),
+            "foul_families": sorted({
+                finding["human_label"] or finding["foul_label"]
+                for finding in findings_by_play[play.id]
+                if finding["review_status"] != "dismissed"
+            }),
+            "human_review_state": (
+                "reviewed" if (
+                    findings_by_play[play.id]
+                    and all(finding["review_status"] != "unreviewed" for finding in findings_by_play[play.id])
+                ) or play.legacy_upload_id in reviewed_upload_ids
+                else "partial" if any(
+                    finding["review_status"] != "unreviewed" for finding in findings_by_play[play.id]
+                )
+                else "unreviewed"
+            ),
         } for play in plays],
         "total": len(plays),
         "uncovered_intervals": find_uncovered_intervals(
@@ -1645,6 +1744,215 @@ async def review_play_finding(
     await db.commit()
     await db.refresh(finding)
     return {"ok": True, "finding": _finding_to_dict(finding)}
+
+
+@app.patch("/api/games/{game_id}/plays/{play_id}/boundary")
+async def update_play_boundary(
+    game_id: int,
+    play_id: int,
+    payload: PlayBoundaryPayload,
+    db: AsyncSession = Depends(get_db),
+    _auth: None = Depends(require_api_key),
+):
+    game = await db.get(Game, game_id)
+    play = await db.get(Play, play_id)
+    if not game or not play or play.game_id != game_id:
+        raise HTTPException(status_code=404, detail="Game play not found")
+    _assert_game_editable(game)
+    if payload.start_time < 0 or payload.end_time <= payload.start_time:
+        raise HTTPException(status_code=400, detail="End time must be after a non-negative start time")
+    if game.source_duration and payload.end_time > game.source_duration:
+        raise HTTPException(status_code=400, detail="Boundary exceeds the source video duration")
+    play.source_start_time = payload.start_time
+    play.source_end_time = payload.end_time
+    play.clip_start_time = payload.start_time
+    play.clip_end_time = payload.end_time
+    play.notes = payload.notes or ""
+    play.detection_method = "human_edited"
+    play.detection_confidence = 1.0
+    play.boundary_flags = []
+    play.boundary_review_status = "approved"
+    upload = await db.get(Upload, play.legacy_upload_id)
+    if upload:
+        upload.start_time = payload.start_time
+        upload.end_time = payload.end_time
+        upload.segment_confidence = 1.0
+        upload.notes = play.notes
+    await _reset_play_for_reanalysis(db, play, clear_clip=True)
+    await _enqueue_selective_analysis(db, game)
+    await db.commit()
+    return {"ok": True, "play_id": play.id, "analysis_revision": play.analysis_revision}
+
+
+@app.post("/api/games/{game_id}/plays/{play_id}/split")
+async def split_game_play(
+    game_id: int,
+    play_id: int,
+    payload: PlaySplitPayload,
+    db: AsyncSession = Depends(get_db),
+    _auth: None = Depends(require_api_key),
+):
+    game = await db.get(Game, game_id)
+    play = await db.get(Play, play_id)
+    if not game or not play or play.game_id != game_id:
+        raise HTTPException(status_code=404, detail="Game play not found")
+    _assert_game_editable(game)
+    if not play.source_start_time + 1.0 <= payload.split_time <= play.source_end_time - 1.0:
+        raise HTTPException(status_code=400, detail="Split must leave at least one second on each side")
+    later_result = await db.execute(
+        select(Play).where(Play.game_id == game_id, Play.play_number > play.play_number)
+        .order_by(Play.play_number.desc())
+    )
+    for later in later_result.scalars().all():
+        later.play_number += 1
+        later_upload = await db.get(Upload, later.legacy_upload_id)
+        if later_upload:
+            later_upload.play_number = later.play_number
+    original_end = play.source_end_time
+    original_upload = await db.get(Upload, play.legacy_upload_id)
+    play.source_end_time = payload.split_time
+    play.clip_end_time = payload.split_time
+    if original_upload:
+        original_upload.end_time = payload.split_time
+    await _reset_play_for_reanalysis(db, play, clear_clip=True)
+    new_upload = Upload(
+        game_id=game.id,
+        play_number=play.play_number + 1,
+        start_time=payload.split_time,
+        end_time=original_end,
+        segment_confidence=1.0,
+        s3_url=game.s3_url,
+        foul_type="",
+        notes=play.notes or "",
+        ruleset=game.ruleset,
+        timestamp=_now_utc(),
+        status="segmented",
+    )
+    db.add(new_upload)
+    await db.flush()
+    new_play = Play(
+        game_id=game.id,
+        legacy_upload_id=new_upload.id,
+        play_number=new_upload.play_number,
+        source_start_time=payload.split_time,
+        source_end_time=original_end,
+        clip_start_time=payload.split_time,
+        clip_end_time=original_end,
+        detection_method="human_split",
+        detection_confidence=1.0,
+        boundary_flags=[],
+        boundary_review_status="approved",
+        analysis_status="queued_for_reanalysis",
+        analysis_revision=1,
+        notes=new_upload.notes,
+        created_at=_now_utc(),
+        updated_at=_now_utc(),
+    )
+    db.add(new_play)
+    game.segment_count = int(game.segment_count or 0) + 1
+    await db.flush()
+    await _enqueue_selective_analysis(db, game)
+    await db.commit()
+    return {"ok": True, "play_ids": [play.id, new_play.id]}
+
+
+@app.post("/api/games/{game_id}/plays/{play_id}/merge")
+async def merge_game_plays(
+    game_id: int,
+    play_id: int,
+    payload: PlayMergePayload,
+    db: AsyncSession = Depends(get_db),
+    _auth: None = Depends(require_api_key),
+):
+    game = await db.get(Game, game_id)
+    play = await db.get(Play, play_id)
+    next_play = await db.get(Play, payload.next_play_id)
+    if not game or not play or not next_play or play.game_id != game_id or next_play.game_id != game_id:
+        raise HTTPException(status_code=404, detail="Game plays not found")
+    _assert_game_editable(game)
+    if next_play.play_number != play.play_number + 1:
+        raise HTTPException(status_code=400, detail="Only consecutive plays can be merged")
+    play.source_end_time = max(play.source_end_time, next_play.source_end_time)
+    play.clip_end_time = play.source_end_time
+    play.detection_method = "human_merge"
+    play.detection_confidence = 1.0
+    play.boundary_flags = []
+    play.boundary_review_status = "approved"
+    upload = await db.get(Upload, play.legacy_upload_id)
+    removed_upload = await db.get(Upload, next_play.legacy_upload_id)
+    if upload:
+        upload.end_time = play.source_end_time
+        upload.segment_confidence = 1.0
+    await _reset_play_for_reanalysis(db, play, clear_clip=True)
+    await db.execute(delete(PlayFinding).where(PlayFinding.play_id == next_play.id))
+    await db.delete(next_play)
+    if removed_upload:
+        await db.delete(removed_upload)
+    later_result = await db.execute(
+        select(Play).where(Play.game_id == game_id, Play.play_number > play.play_number + 1)
+        .order_by(Play.play_number)
+    )
+    for later in later_result.scalars().all():
+        later.play_number -= 1
+        later_upload = await db.get(Upload, later.legacy_upload_id)
+        if later_upload:
+            later_upload.play_number = later.play_number
+    game.segment_count = max(0, int(game.segment_count or 0) - 1)
+    await db.flush()
+    await _enqueue_selective_analysis(db, game)
+    await db.commit()
+    return {"ok": True, "play_id": play.id}
+
+
+@app.post("/api/games/{game_id}/plays/{play_id}/reanalyze")
+async def reanalyze_game_play(
+    game_id: int,
+    play_id: int,
+    db: AsyncSession = Depends(get_db),
+    _auth: None = Depends(require_api_key),
+):
+    game = await db.get(Game, game_id)
+    play = await db.get(Play, play_id)
+    if not game or not play or play.game_id != game_id:
+        raise HTTPException(status_code=404, detail="Game play not found")
+    _assert_game_editable(game)
+    await _reset_play_for_reanalysis(db, play, clear_clip=False)
+    await _enqueue_selective_analysis(db, game)
+    await db.commit()
+    return {"ok": True, "play_id": play.id, "analysis_revision": play.analysis_revision}
+
+
+@app.delete("/api/games/{game_id}/plays/{play_id}")
+async def remove_game_play(
+    game_id: int,
+    play_id: int,
+    db: AsyncSession = Depends(get_db),
+    _auth: None = Depends(require_api_key),
+):
+    game = await db.get(Game, game_id)
+    play = await db.get(Play, play_id)
+    if not game or not play or play.game_id != game_id:
+        raise HTTPException(status_code=404, detail="Game play not found")
+    _assert_game_editable(game)
+    removed_number = play.play_number
+    upload = await db.get(Upload, play.legacy_upload_id)
+    await db.execute(delete(PlayFinding).where(PlayFinding.play_id == play.id))
+    await db.delete(play)
+    if upload:
+        await db.delete(upload)
+    later_result = await db.execute(
+        select(Play).where(Play.game_id == game_id, Play.play_number > removed_number)
+        .order_by(Play.play_number)
+    )
+    for later in later_result.scalars().all():
+        later.play_number -= 1
+        later_upload = await db.get(Upload, later.legacy_upload_id)
+        if later_upload:
+            later_upload.play_number = later.play_number
+    game.segment_count = max(0, int(game.segment_count or 0) - 1)
+    game.analyzed_count = min(int(game.analyzed_count or 0), game.segment_count)
+    await db.commit()
+    return {"ok": True, "removed_play_id": play_id}
 
 
 @app.post("/api/plays/{play_id}/findings")

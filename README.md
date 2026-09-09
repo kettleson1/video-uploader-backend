@@ -154,6 +154,11 @@ http://localhost:8000/api/docs
 | `/api/games/{game_id}/timeline` | GET | Return migrated plays, findings, and processing-job state for a full game |
 | `/api/play-findings/{finding_id}/review` | PATCH | Agree with, correct, dismiss, or clear review of one foul finding |
 | `/api/plays/{play_id}/findings` | POST | Add an official finding to a full-game play |
+| `/api/games/{game_id}/plays/{play_id}/boundary` | PATCH | Adjust one play boundary and queue selective re-analysis |
+| `/api/games/{game_id}/plays/{play_id}/split` | POST | Split one candidate into two plays |
+| `/api/games/{game_id}/plays/{play_id}/merge` | POST | Merge two consecutive plays |
+| `/api/games/{game_id}/plays/{play_id}/reanalyze` | POST | Re-analyze one play without changing its boundary |
+| `/api/games/{game_id}/plays/{play_id}` | DELETE | Remove one candidate and renumber later plays |
 
 Full-game play analysis may return multiple independent foul or uncertain
 findings. A completed no-foul review is represented by `result: "NO FOUL"` and

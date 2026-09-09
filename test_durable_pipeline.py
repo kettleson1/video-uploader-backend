@@ -43,6 +43,18 @@ class DurablePipelineContractTests(unittest.TestCase):
         self.assertIn("on_conflict_do_nothing", source)
         self.assertIn("heartbeat_job", source)
 
+    def test_timeline_edit_routes_are_selective(self):
+        source = (BACKEND_DIR / "main.py").read_text()
+        for route in (
+            '@app.patch("/api/games/{game_id}/plays/{play_id}/boundary")',
+            '@app.post("/api/games/{game_id}/plays/{play_id}/split")',
+            '@app.post("/api/games/{game_id}/plays/{play_id}/merge")',
+            '@app.post("/api/games/{game_id}/plays/{play_id}/reanalyze")',
+            '@app.delete("/api/games/{game_id}/plays/{play_id}")',
+        ):
+            self.assertIn(route, source)
+        self.assertIn("analysis_revision", source)
+
 
 if __name__ == "__main__":
     unittest.main()

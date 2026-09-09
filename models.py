@@ -91,6 +91,7 @@ class Play(Base):
     boundary_review_status = Column(Text, default="unreviewed")
     analysis_status = Column(Text, default="pending")
     analysis_version = Column(Text)
+    analysis_revision = Column(Integer, default=0)
     broad_screen = Column(Text)
     retrieved_rules = Column(JSONB)
     analysis_payload = Column(JSONB)

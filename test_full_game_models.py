@@ -31,7 +31,7 @@ class FullGameModelContractTests(unittest.TestCase):
         self.assertTrue({
             "legacy_upload_id", "source_start_time",
             "detection_confidence", "analysis_status", "snap_time",
-            "live_ball_end_time", "boundary_flags",
+            "live_ball_end_time", "boundary_flags", "analysis_revision",
         } <= model_columns("Play"))
 
     def test_findings_support_multiple_rulings_per_play(self):

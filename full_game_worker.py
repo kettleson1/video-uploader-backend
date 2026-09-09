@@ -61,11 +61,11 @@ async def enqueue_finalize_if_ready(db, game_id: int):
     if remaining:
         return
     ids_result = await db.execute(
-        select(Play.id).where(Play.game_id == game_id).order_by(Play.id)
+        select(Play.id, Play.analysis_revision).where(Play.game_id == game_id).order_by(Play.id)
     )
-    play_ids = list(ids_result.scalars().all())
+    play_versions = ids_result.all()
     signature = hashlib.sha256(
-        ",".join(str(play_id) for play_id in play_ids).encode("ascii")
+        ",".join(f"{row.id}:{row.analysis_revision or 0}" for row in play_versions).encode("ascii")
     ).hexdigest()[:16]
     await enqueue_job(
         db,
@@ -194,11 +194,18 @@ async def handle_extract_clips(job: ProcessingJob):
         plays = plays_result.scalars().all()
         if not plays:
             raise RuntimeError("No detected plays are available")
+        target_plays = [
+            play for play in plays
+            if not play.clip_s3_url
+            or play.analysis_status in {"segmented", "queued_for_reanalysis", "error"}
+        ]
+        if not target_plays:
+            return
         game.status = "extracting_clips"
         game.progress = 0.28
         await db.commit()
         video_bytes = await read_s3(game.s3_url)
-        for play in plays:
+        for play in target_plays:
             if not play.clip_s3_url:
                 clip = await asyncio.to_thread(
                     _extract_clip_bytes,
@@ -217,7 +224,7 @@ async def handle_extract_clips(job: ProcessingJob):
                 upload.status = "queued"
             await enqueue_job(
                 db,
-                job_key=f"play:{play.id}:screen:multi-v1",
+                job_key=f"play:{play.id}:screen:multi-v1:r{play.analysis_revision or 0}",
                 game_id=game.id,
                 play_id=play.id,
                 stage="screen_play",
@@ -245,7 +252,7 @@ async def handle_screen_play(job: ProcessingJob):
         play.updated_at = now_utc()
         await enqueue_job(
             db,
-            job_key=f"play:{play.id}:retrieve_rules:multi-v1",
+            job_key=f"play:{play.id}:retrieve_rules:multi-v1:r{play.analysis_revision or 0}",
             game_id=game.id,
             play_id=play.id,
             stage="retrieve_rules",
@@ -268,7 +275,7 @@ async def handle_retrieve_rules(job: ProcessingJob):
         play.updated_at = now_utc()
         await enqueue_job(
             db,
-            job_key=f"play:{play.id}:analyze_foul:multi-v1",
+            job_key=f"play:{play.id}:analyze_foul:multi-v1:r{play.analysis_revision or 0}",
             game_id=game.id,
             play_id=play.id,
             stage="analyze_foul",
@@ -297,7 +304,7 @@ async def handle_analyze_foul(job: ProcessingJob):
         play.updated_at = now_utc()
         await enqueue_job(
             db,
-            job_key=f"play:{play.id}:store_findings:multi-v1",
+            job_key=f"play:{play.id}:store_findings:multi-v1:r{play.analysis_revision or 0}",
             game_id=game.id,
             play_id=play.id,
             stage="store_findings",
