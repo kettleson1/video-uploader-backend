@@ -2,6 +2,7 @@ import unittest
 
 from coaches_film_detector import (
     ActivitySample,
+    detect_cutup_play_boundaries,
     detect_play_boundaries,
     find_uncovered_intervals,
 )
@@ -16,6 +17,37 @@ def samples(scores, interval=0.5):
 
 
 class DetectPlayBoundariesTests(unittest.TestCase):
+    def test_repeated_black_transitions_split_cutup_without_gaps(self):
+        transitions = [
+            {"start_time": 12.0, "end_time": 12.1},
+            {"start_time": 27.0, "end_time": 27.1},
+        ]
+        activity = [
+            ActivitySample(time=5.0, score=8.0),
+            ActivitySample(time=20.0, score=9.0),
+            ActivitySample(time=32.0, score=0.5),
+        ]
+
+        result = detect_cutup_play_boundaries(
+            transitions, video_duration=40.0, samples=activity
+        )
+
+        self.assertEqual(len(result), 3)
+        self.assertEqual(result[0]["start_time"], 0.0)
+        self.assertEqual(result[-1]["end_time"], 40.0)
+        self.assertEqual(result[0]["end_time"], result[1]["start_time"])
+        self.assertEqual(result[1]["end_time"], result[2]["start_time"])
+        self.assertEqual(result[0]["detection_method"], "coaches_cutup_transitions")
+        self.assertIn("low_activity_candidate", result[-1]["boundary_flags"])
+
+    def test_one_black_frame_does_not_override_continuous_film_detector(self):
+        result = detect_cutup_play_boundaries(
+            [{"start_time": 12.0, "end_time": 12.1}],
+            video_duration=40.0,
+        )
+
+        self.assertEqual(result, [])
+
     def test_detects_and_numbers_separate_activity_runs(self):
         scores = [0.5] * 20 + [12.0] * 12 + [0.5] * 30 + [10.0] * 10 + [0.5] * 10
         result = detect_play_boundaries(samples(scores), video_duration=41.0)

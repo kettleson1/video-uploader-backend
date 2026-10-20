@@ -7,6 +7,7 @@ small grayscale frames; the pure boundary function is deterministic and testable
 from __future__ import annotations
 
 import os
+import re
 import statistics
 import subprocess
 import tempfile
@@ -20,6 +21,94 @@ class ActivitySample:
     score: float
     active_region_ratio: float = 0.0
     spatial_spread: float = 0.0
+
+
+BLACK_INTERVAL_PATTERN = re.compile(
+    r"black_start:(?P<start>[0-9.]+)\s+"
+    r"black_end:(?P<end>[0-9.]+)\s+"
+    r"black_duration:(?P<duration>[0-9.]+)"
+)
+
+
+def extract_black_intervals(video_bytes: bytes) -> List[dict]:
+    """Find brief black frames commonly inserted between coaches-film clips."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        source_path = os.path.join(temp_dir, "coaches-film-input")
+        with open(source_path, "wb") as source_file:
+            source_file.write(video_bytes)
+        command = [
+            "ffmpeg", "-v", "info", "-i", source_path,
+            "-vf", "scale=320:-1:flags=area,blackdetect=d=0.01:pix_th=0.15:pic_th=0.75",
+            "-an", "-f", "null", "-",
+        ]
+        process = subprocess.run(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        if process.returncode != 0:
+            detail = (process.stderr or "").strip()
+            raise RuntimeError(f"Could not inspect coaches-film transitions: {detail[-300:]}")
+        return [
+            {
+                "start_time": float(match.group("start")),
+                "end_time": float(match.group("end")),
+                "duration": float(match.group("duration")),
+            }
+            for match in BLACK_INTERVAL_PATTERN.finditer(process.stderr or "")
+        ]
+
+
+def detect_cutup_play_boundaries(
+    black_intervals: Sequence[dict],
+    video_duration: float,
+    samples: Sequence[ActivitySample] = (),
+    minimum_transitions: int = 2,
+    minimum_play_seconds: float = 4.0,
+    maximum_plays: int = 200,
+) -> List[dict]:
+    """Split an exported cut-up at repeated black transitions, without gaps."""
+    if video_duration <= 0 or len(black_intervals) < minimum_transitions:
+        return []
+    boundaries = [0.0]
+    for interval in black_intervals:
+        start = max(0.0, float(interval["start_time"]))
+        end = min(video_duration, float(interval["end_time"]))
+        midpoint = (start + end) / 2.0
+        if midpoint - boundaries[-1] >= minimum_play_seconds:
+            boundaries.append(midpoint)
+    if video_duration - boundaries[-1] < minimum_play_seconds:
+        boundaries[-1] = video_duration
+    else:
+        boundaries.append(video_duration)
+
+    candidates = []
+    for start, end in zip(boundaries, boundaries[1:]):
+        if end - start < minimum_play_seconds:
+            continue
+        segment_samples = [sample for sample in samples if start <= sample.time < end]
+        flags = ["cut_up_transition_segmentation"]
+        confidence = 0.90
+        if segment_samples and max(sample.score for sample in segment_samples) < 5.0:
+            flags.append("low_activity_candidate")
+            confidence = 0.35
+        candidates.append({
+            "play_number": len(candidates) + 1,
+            "start_time": round(start, 2),
+            "end_time": round(end, 2),
+            "snap_time": None,
+            "live_ball_end_time": None,
+            "segment_confidence": confidence,
+            "boundary_flags": flags,
+            "detection_method": "coaches_cutup_transitions",
+        })
+        if len(candidates) >= maximum_plays:
+            candidates[-1]["end_time"] = round(video_duration, 2)
+            candidates[-1]["boundary_flags"].append("candidate_limit_merge")
+            break
+    return candidates
 
 
 def extract_activity_samples(

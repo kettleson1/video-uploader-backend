@@ -13,8 +13,10 @@ from datetime import datetime, timezone
 from typing import List, Optional
 from models import Game, Play, PlayFinding, ProcessingJob, SegmentationComparison, Upload, Rule
 from coaches_film_detector import (
+    detect_cutup_play_boundaries,
     detect_play_boundaries,
     extract_activity_samples,
+    extract_black_intervals,
     find_uncovered_intervals,
 )
 from job_queue import enqueue_job
@@ -645,7 +647,10 @@ def _detect_play_segments_with_comparison(video_bytes: bytes):
     detector_error = None
     try:
         samples = extract_activity_samples(video_bytes)
-        play_first = detect_play_boundaries(samples, duration)
+        black_intervals = extract_black_intervals(video_bytes)
+        play_first = detect_cutup_play_boundaries(
+            black_intervals, duration, samples=samples
+        ) or detect_play_boundaries(samples, duration)
     except Exception as error:
         if PLAY_DETECTOR_MODE not in {"coaches_activity_with_fallback", "shadow_compare"}:
             raise
@@ -659,7 +664,7 @@ def _detect_play_segments_with_comparison(video_bytes: bytes):
         )
         selected = play_first if selected_method == "coaches_activity" else legacy
         for candidate in selected:
-            candidate["detection_method"] = selected_method
+            candidate.setdefault("detection_method", selected_method)
         comparison = {
             **metrics,
             "detector_mode": PLAY_DETECTOR_MODE,
@@ -673,7 +678,7 @@ def _detect_play_segments_with_comparison(video_bytes: bytes):
 
     if play_first or PLAY_DETECTOR_MODE != "coaches_activity_with_fallback":
         for candidate in play_first:
-            candidate["detection_method"] = "coaches_activity"
+            candidate.setdefault("detection_method", "coaches_activity")
         return play_first, None
     for candidate in legacy:
         candidate["detection_method"] = "legacy_fixed_window"

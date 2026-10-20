@@ -185,6 +185,13 @@ API exposes the new model.
 - `coaches_activity`: use only the new detector and surface detection failures.
 - `fixed_window`: use the retained legacy segmentation path.
 
+The play-first detector checks first for repeated, brief black transitions used
+by many exported coaches-film cut-ups. When present, those transitions produce
+ordered, gap-free source clips (`coaches_cutup_transitions`). Continuous film
+without repeated transitions continues through formation/activity detection.
+Low-activity cut-up intervals remain visible and flagged for review rather than
+being silently discarded.
+
 Fixed-window comparisons are a baseline, not labeled ground truth. The API calls
 non-overlapping candidates `unmatched`; it does not call them missed plays. Once
 an official edits a timeline, correction counts and total boundary movement are
