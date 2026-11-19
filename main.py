@@ -21,7 +21,13 @@ from coaches_film_detector import (
 )
 from job_queue import enqueue_job
 from foul_findings import normalize_findings_payload
+from ball_exchange import EXCHANGE_GUIDANCE
 from segmentation_comparison import compare_segmentations
+from video_frames import (
+    extract_focused_frames as _extract_focused_frames,
+    extract_timestamped_frames as _extract_timestamped_frames,
+    probe_video_path_duration as _probe_video_path_duration,
+)
 
 import boto3
 from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, Query, Body, HTTPException, Depends, Header
@@ -62,6 +68,10 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_EMBED_MODEL = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-large")  # 3072-D
 CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.60"))
+VISUAL_ANALYSIS_MAX_FRAMES = max(1, min(24, int(os.getenv("VISUAL_ANALYSIS_MAX_FRAMES", "12"))))
+FOCUSED_REVIEW_WINDOW_SECONDS = max(0.5, min(5.0, float(os.getenv("FOCUSED_REVIEW_WINDOW_SECONDS", "2"))))
+FOCUSED_REVIEW_FPS = max(1.0, min(8.0, float(os.getenv("FOCUSED_REVIEW_FPS", "4"))))
+FOCUSED_REVIEW_MAX_FRAMES = max(4, min(32, int(os.getenv("FOCUSED_REVIEW_MAX_FRAMES", "20"))))
 PLAY_DETECTOR_MODE = os.getenv("PLAY_DETECTOR_MODE", "shadow_compare")
 PLAY_FIRST_ACCEPTED = os.getenv("PLAY_FIRST_ACCEPTED", "false").strip().lower() in {"1", "true", "yes"}
 LEGACY_GAME_SEGMENT_SECONDS = float(os.getenv("LEGACY_GAME_SEGMENT_SECONDS", "35"))
@@ -76,7 +86,11 @@ s3_client = boto3.client("s3", region_name=AWS_REGION)
 SYNC_DATABASE_URL = DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://")
 engine = create_engine(SYNC_DATABASE_URL)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
-client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+client = AsyncOpenAI(
+    api_key=OPENAI_API_KEY,
+    timeout=float(os.getenv("OPENAI_REQUEST_TIMEOUT_SECONDS", "120")),
+    max_retries=max(0, int(os.getenv("OPENAI_MAX_RETRIES", "4"))),
+)
 
 RULESETS = {
     "high_school": {
@@ -580,54 +594,12 @@ def _presign(key: str, expires: int = 3600) -> Optional[str]:
     except Exception:
         return None
 
-def _extract_frames(video_bytes: bytes, fps: int = 1, max_frames: int = 6) -> List[str]:
-    """
-    Return a list of base64-encoded JPEG frames (strings).
-    """
-    frames_b64: List[str] = []
-    with tempfile.TemporaryDirectory() as td:
-        src = os.path.join(td, "in.mp4")
-        with open(src, "wb") as f:
-            f.write(video_bytes)
-        out_tpl = os.path.join(td, "frame_%04d.jpg")
-        # extract jpg frames
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", src,
-            "-vf", f"fps={fps}",
-            "-q:v", "2",
-            out_tpl
-        ]
-        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-        # load up to max_frames
-        for name in sorted(os.listdir(td)):
-            if not name.lower().endswith(".jpg"):
-                continue
-            if len(frames_b64) >= max_frames:
-                break
-            p = os.path.join(td, name)
-            with open(p, "rb") as jf:
-                b64 = base64.b64encode(jf.read()).decode("utf-8")  # defensive: return str
-                frames_b64.append(b64)
-    return frames_b64
-
 def _probe_video_duration(video_bytes: bytes) -> float:
     with tempfile.TemporaryDirectory() as td:
         src = os.path.join(td, "game.mp4")
         with open(src, "wb") as f:
             f.write(video_bytes)
-        cmd = [
-            "ffprobe",
-            "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            src,
-        ]
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
-        try:
-            return max(0.0, float((proc.stdout or "0").strip()))
-        except ValueError:
-            return 0.0
+        return _probe_video_path_duration(src)
 
 def _detect_play_segments(video_bytes: bytes) -> List[dict]:
     """
@@ -740,50 +712,88 @@ def _result_from_label(label: str, confidence: float) -> str:
         return "UNCERTAIN"
     return "FOUL"
 
-async def _summarize_frames_async(
-    frames_b64: List[str],
+def _normalize_candidate_events(raw_events, duration: float) -> List[dict]:
+    events: List[dict] = []
+    if not isinstance(raw_events, list):
+        return events
+    for raw_event in raw_events:
+        if isinstance(raw_event, (int, float, str)):
+            raw_event = {"event_time": raw_event}
+        if not isinstance(raw_event, dict):
+            continue
+        try:
+            event_time = float(raw_event.get("event_time"))
+        except (TypeError, ValueError):
+            continue
+        event_time = max(0.0, min(duration, event_time))
+        if any(abs(event_time - existing["event_time"]) < 0.25 for existing in events):
+            continue
+        events.append({
+            "event_time": event_time,
+            "possible_foul_family": str(raw_event.get("possible_foul_family") or "unknown"),
+            "visible_reason": str(raw_event.get("visible_reason") or "Possible material contact."),
+        })
+        if len(events) >= 2:
+            break
+    return events
+
+
+def _timestamped_frame_content(intro: str, frames: List[dict]) -> list[dict]:
+    content: list[dict] = [{"type": "text", "text": intro}]
+    for index, frame in enumerate(frames, start=1):
+        timestamp = float(frame.get("timestamp") or 0.0)
+        image_b64 = str(frame.get("image_b64") or "")
+        if not image_b64:
+            continue
+        content.append({
+            "type": "text",
+            "text": f"Frame {index}: {timestamp:.2f} seconds from the start of the play clip.",
+        })
+        content.append({
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:image/jpeg;base64,{image_b64}",
+                "detail": os.getenv("OPENAI_IMAGE_DETAIL", "high"),
+            },
+        })
+    return content
+
+
+async def _screen_frames_async(
+    frames: List[dict],
+    duration: float,
     foul_hint: str = "",
     notes: str = "",
     ruleset: str = "high_school",
-) -> str:
-    """
-    Async: Summarize the play from a handful of actual video frames.
-    """
-    if not frames_b64:
-        return "No visual context available."
+) -> dict:
+    """Broadly screen a complete play and nominate possible contact timestamps."""
+    if not frames:
+        return {"summary": "No visual context available.", "candidate_events": []}
 
     rules_context = _ruleset_context(ruleset)
     system_prompt = (
         f"You are {rules_context['assistant']}. "
-        "Describe only what is visible in the frames. Be precise about timing, "
+        "Screen the complete play using chronological, timestamped frames. Describe only what is visible. "
+        "Be precise about timing, "
         "player roles, ball location, contact type, target area, and whether the "
-        "action is clear or ambiguous. Do not invent unseen action."
+        "action is clear or ambiguous. Do not invent unseen action or make the final foul ruling."
     )
 
     user_text = (
-        f"Analyze these {len(frames_b64)} chronological frames from one football play.\n"
+        f"Analyze these {len(frames)} chronological frames spanning a {duration:.2f}-second football play.\n"
         f"Ruleset to apply later: {rules_context['label']}\n"
         f"Selected foul type from the form: {foul_hint or 'not provided'}\n"
         f"Official/user notes: {notes or 'none'}\n\n"
-        "Return a compact evidence summary for rule lookup with these fields:\n"
-        "- play phase\n"
-        "- key visible action\n"
-        "- timing relative to snap/pass/kick/ball arrival if visible\n"
-        "- players involved\n"
-        "- possible foul indicators\n"
-        "- uncertainty or missing camera evidence\n"
-        "Keep it under 180 words."
+        "Return JSON with exactly these keys:\n"
+        "- evidence_summary: under 180 words covering play phase, play type, forward-pass status, "
+        "key action, timing, players, possible foul indicators, and missing evidence\n"
+        "- candidate_events: zero to two events that deserve dense temporal review\n\n"
+        "Each candidate event must contain event_time (seconds from clip start), "
+        "possible_foul_family, and visible_reason. Nominate an event when closer frames could resolve "
+        "contact timing, ball arrival, grasping, pulling, hooking, encircling, tackling, or material restriction. "
+        "Return an empty candidate_events array when no such contact is visible."
     )
-
-    content: list[dict] = [{"type": "text", "text": user_text}]
-    for frame in frames_b64:
-        content.append({
-            "type": "image_url",
-            "image_url": {
-                "url": f"data:image/jpeg;base64,{frame}",
-                "detail": os.getenv("OPENAI_IMAGE_DETAIL", "high"),
-            },
-        })
+    content = _timestamped_frame_content(user_text + "\n" + EXCHANGE_GUIDANCE, frames)
 
     chat = await client.chat.completions.create(
         model=os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini"),
@@ -792,9 +802,126 @@ async def _summarize_frames_async(
             {"role": "user", "content": content},
         ],
         temperature=0.2,
-        max_tokens=320,
+        max_tokens=520,
+        response_format={"type": "json_object"},
+    )
+    txt = (chat.choices[0].message.content or "").strip()
+    try:
+        data = json.loads(txt)
+    except Exception:
+        return {"summary": txt or "No usable broad visual summary.", "candidate_events": []}
+    summary = str(data.get("evidence_summary") or "No usable broad visual summary.").strip()
+    return {
+        "summary": summary,
+        "candidate_events": _normalize_candidate_events(data.get("candidate_events"), duration),
+    }
+
+
+async def _focused_contact_summary_async(
+    frames: List[dict],
+    broad_summary: str,
+    candidate_events: List[dict],
+    ruleset: str = "high_school",
+) -> str:
+    """Describe the before/during/after sequence around suspected contact."""
+    if not frames:
+        return ""
+    rules_context = _ruleset_context(ruleset)
+    events_text = "\n".join(
+        f"- {event['event_time']:.2f}s: {event['possible_foul_family']} — {event['visible_reason']}"
+        for event in candidate_events
+    )
+    system_prompt = (
+        f"You are {rules_context['assistant']} performing focused temporal evidence review. "
+        "Compare the timestamped frames in order and describe only visible changes. Do not infer action "
+        "between frames and do not make the final ruling."
+    )
+    user_text = (
+        f"BROAD PLAY SUMMARY:\n{broad_summary}\n\n"
+        f"SUSPECTED EVENTS:\n{events_text}\n\n"
+        "Review the dense before/during/after sequence. State:\n"
+        "- whether and when a legal forward pass is released and the ball arrives, if visible\n"
+        "- whether contact occurs before, at, or after ball arrival\n"
+        "- the exact visible contact: grasp, hook, pull, encircle, tackle, push, displacement, or ordinary engagement\n"
+        "- whether the opponent's path, balance, reach, or opportunity is visibly and materially restricted\n"
+        "- which required element remains unseen\n"
+        "Use exact frame timestamps and keep the response under 220 words."
+    )
+    content = _timestamped_frame_content(user_text + "\n" + EXCHANGE_GUIDANCE, frames)
+    chat = await client.chat.completions.create(
+        model=os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini"),
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": content},
+        ],
+        temperature=0.1,
+        max_tokens=420,
     )
     return (chat.choices[0].message.content or "").strip()
+
+
+async def _build_visual_evidence_async(
+    video_bytes: bytes,
+    foul_hint: str = "",
+    notes: str = "",
+    ruleset: str = "high_school",
+) -> tuple[str, int, int]:
+    """Run broad full-play screening followed by optional dense contact review."""
+    duration = _probe_video_duration(video_bytes)
+    broad_frames = _extract_timestamped_frames(
+        video_bytes, fps=1, max_frames=VISUAL_ANALYSIS_MAX_FRAMES
+    )
+    screening = await _screen_frames_async(
+        broad_frames,
+        duration=duration,
+        foul_hint=foul_hint,
+        notes=notes,
+        ruleset=ruleset,
+    )
+    summary = screening["summary"]
+    candidate_events = screening["candidate_events"]
+    focused_frames: List[dict] = []
+    if candidate_events:
+        focused_frames = _extract_focused_frames(
+            video_bytes,
+            [event["event_time"] for event in candidate_events],
+            window_seconds=FOCUSED_REVIEW_WINDOW_SECONDS,
+            fps=FOCUSED_REVIEW_FPS,
+            max_frames=FOCUSED_REVIEW_MAX_FRAMES,
+        )
+        focused_summary = await _focused_contact_summary_async(
+            focused_frames,
+            broad_summary=summary,
+            candidate_events=candidate_events,
+            ruleset=ruleset,
+        )
+        if focused_summary:
+            summary = (
+                f"BROAD FULL-PLAY REVIEW:\n{summary}\n\n"
+                f"FOCUSED TEMPORAL CONTACT REVIEW:\n{focused_summary}"
+            )
+    return summary, len(broad_frames), len(focused_frames)
+
+
+async def _summarize_frames_async(
+    frames_b64: List[str],
+    foul_hint: str = "",
+    notes: str = "",
+    ruleset: str = "high_school",
+) -> str:
+    """Backward-compatible summary helper for callers with base64-only frames."""
+    timestamped = [
+        {"timestamp": float(index), "image_b64": frame}
+        for index, frame in enumerate(frames_b64)
+    ]
+    screening = await _screen_frames_async(
+        timestamped,
+        duration=float(max(1, len(timestamped))),
+        foul_hint=foul_hint,
+        notes=notes,
+        ruleset=ruleset,
+    )
+    return screening["summary"]
 
 async def _embed_text(text_in: str) -> List[float]:
     """
@@ -875,7 +1002,9 @@ async def _predict_with_rules(
         f"You are a {rules_context['label']} rules assistant. "
         "Choose the most likely foul label only when the video evidence and rule snippets support it. "
         "If the evidence is unclear or no provided rule fits, use 'None' or 'Uncertain'. "
-        "Ground the explanation in visible evidence and the cited snippets."
+        "Ground the explanation in visible evidence and the cited snippets. "
+        "Pass interference is inapplicable unless the evidence establishes that a legal forward pass was thrown. "
+        "Do not label ordinary blocking as holding; require visible restriction that materially impedes an opponent."
     )
     user_prompt = (
         f"PLAY SUMMARY:\n{summary}\n\n"
@@ -890,7 +1019,7 @@ async def _predict_with_rules(
     chat = await client.chat.completions.create(
         model=os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini"),
         messages=[
-            {"role": "system", "content": sys_prompt},
+            {"role": "system", "content": sys_prompt + " " + EXCHANGE_GUIDANCE},
             {"role": "user", "content": user_prompt},
         ],
         temperature=0.1,
@@ -948,7 +1077,13 @@ async def _predict_batch_with_rules(
         "You are not making an official ruling. Identify every independently supported foul "
         "or uncertain foul candidate visible on the play. Do not decide enforcement, acceptance, "
         "declination, offsetting administration, or disqualification. Only classify a foul when "
-        "the visible evidence and rule snippets support its required elements."
+        "the visible evidence and rule snippets support its required elements. "
+        "Apply these mandatory gates: never return offensive or defensive pass interference unless the evidence "
+        "establishes that a legal forward pass was thrown; if the play is a run or no forward pass is visible, "
+        "pass interference is not a candidate. Never return holding from contact or close engagement alone; "
+        "require visible grasping, hooking, encircling, pulling, tackling, or comparable restriction that materially "
+        "impedes an opponent beyond ordinary legal blocking. When a required element is not visible, omit the finding "
+        "or mark it uncertain rather than inferring the element."
     )
     user_prompt = (
         f"PLAY SUMMARY:\n{summary}\n"
@@ -971,7 +1106,7 @@ async def _predict_batch_with_rules(
     chat = await client.chat.completions.create(
         model=os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini"),
         messages=[
-            {"role": "system", "content": sys_prompt},
+            {"role": "system", "content": sys_prompt + " " + EXCHANGE_GUIDANCE},
             {"role": "user", "content": user_prompt},
         ],
         temperature=0.1,
@@ -1035,16 +1170,17 @@ async def _process_upload_bg(
 
             print("✅ Video downloaded from S3")
 
-            # 2) Frames -> summary
-            frames = _extract_frames(video_bytes, fps=1, max_frames=6)
-            print(f"📸 Extracted {len(frames)} frames")
-
+            # 2) Broad full-play screening -> focused temporal contact review
             ruleset = _normalize_ruleset(ruleset)
-            summary = await _summarize_frames_async(
-                frames,
+            summary, broad_frame_count, focused_frame_count = await _build_visual_evidence_async(
+                video_bytes,
                 foul_hint=foul_hint,
                 notes=notes,
                 ruleset=ruleset,
+            )
+            print(
+                f"📸 Reviewed {broad_frame_count} broad frames and "
+                f"{focused_frame_count} focused frames"
             )
             print(f"✍️ Summary: {summary}")
 
@@ -1325,12 +1461,15 @@ async def _analyze_game_bg(game_id: int):
                     s3_client.put_object(Bucket=BUCKET_NAME, Key=key_name, Body=clip_bytes, ContentType="video/mp4")
                     clip_s3_url = f"https://{BUCKET_NAME}.s3.{AWS_REGION}.amazonaws.com/{key_name}"
 
-                    frames = _extract_frames(clip_bytes, fps=1, max_frames=8)
-                    summary = await _summarize_frames_async(
-                        frames,
+                    summary, broad_frame_count, focused_frame_count = await _build_visual_evidence_async(
+                        clip_bytes,
                         foul_hint="",
                         notes=play.notes or "",
                         ruleset=game.ruleset,
+                    )
+                    print(
+                        f"📸 Play {play.play_number or index}: reviewed {broad_frame_count} broad "
+                        f"frames and {focused_frame_count} focused frames"
                     )
                     retrieval_query = "\n".join(
                         part for part in [

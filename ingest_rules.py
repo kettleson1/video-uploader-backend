@@ -17,7 +17,10 @@ if not DATABASE_URL:
     raise SystemExit("ERROR: DATABASE_URL is not set in your environment or .env")
 
 OPENAI_EMBED_MODEL = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-large")  # 3072-D
-client = OpenAI()
+client = OpenAI(
+    timeout=float(os.getenv("OPENAI_REQUEST_TIMEOUT_SECONDS", "120")),
+    max_retries=max(0, int(os.getenv("OPENAI_MAX_RETRIES", "4"))),
+)
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
 

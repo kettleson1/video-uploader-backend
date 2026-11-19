@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import csv
 import json
 import mimetypes
@@ -45,6 +46,8 @@ def normalize_label(value: Any) -> str:
 
 def result_from_label(value: Any) -> str:
     text = "" if value is None else str(value).strip().lower().replace("_", " ")
+    if text == "uncertain":
+        return "UNCERTAIN"
     return "NO FOUL" if text in NO_FOUL_LABELS else "FOUL"
 
 
@@ -126,13 +129,20 @@ def validate_clips(clips: list[GoldenClip]) -> None:
         raise ValueError("\n\n".join(problems))
 
 
-def http_json(method: str, url: str, api_key: str, body: bytes | None = None, headers: dict[str, str] | None = None) -> Any:
+def http_json(
+    method: str,
+    url: str,
+    api_key: str,
+    body: bytes | None = None,
+    headers: dict[str, str] | None = None,
+    timeout_seconds: int = 60,
+) -> Any:
     req_headers = {"X-DAVE-API-Key": api_key}
     if headers:
         req_headers.update(headers)
     req = request.Request(url, data=body, headers=req_headers, method=method)
     try:
-        with request.urlopen(req, timeout=60) as response:
+        with request.urlopen(req, timeout=timeout_seconds) as response:
             payload = response.read().decode("utf-8")
     except error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
@@ -173,10 +183,21 @@ def multipart_body(fields: dict[str, str], file_field: str, file_path: Path) -> 
     return b"".join(chunks), f"multipart/form-data; boundary={boundary}"
 
 
-def upload_clip(base_url: str, api_key: str, clip: GoldenClip, run_id: str) -> int:
-    notes = f"[golden-eval:{run_id}] {clip.clip_id} {clip.filename}. Expected: {clip.expected_result} {clip.expected_label}. {clip.notes}"
+def upload_clip(
+    base_url: str,
+    api_key: str,
+    clip: GoldenClip,
+    run_id: str,
+    blind: bool = False,
+) -> int:
+    if blind:
+        foul_type = ""
+        notes = f"[golden-eval:{run_id}] {clip.clip_id} {clip.filename}. Blind evaluation."
+    else:
+        foul_type = clip.expected_label
+        notes = f"[golden-eval:{run_id}] {clip.clip_id} {clip.filename}. Expected: {clip.expected_result} {clip.expected_label}. {clip.notes}"
     body, content_type = multipart_body(
-        fields={"foul_type": clip.expected_label, "notes": notes},
+        fields={"foul_type": foul_type, "notes": notes},
         file_field="file",
         file_path=clip.video_path,
     )
@@ -186,6 +207,7 @@ def upload_clip(base_url: str, api_key: str, clip: GoldenClip, run_id: str) -> i
         api_key,
         body=body,
         headers={"Content-Type": content_type, "Content-Length": str(len(body))},
+        timeout_seconds=300,
     )
     upload_id = response.get("id")
     if not upload_id:
@@ -222,7 +244,12 @@ def score_clip(clip: GoldenClip, play: dict[str, Any]) -> dict[str, Any]:
     expected_label_norm = normalize_label(clip.expected_label)
     predicted_label_norm = normalize_label(predicted_label)
     expected_result = clip.expected_result.strip().upper()
-    predicted_result = result_from_label(predicted_label)
+    stored_result = str(play.get("result") or "").strip().upper().replace("_", " ")
+    predicted_result = (
+        stored_result
+        if stored_result in {"FOUL", "NO FOUL", "UNCERTAIN"}
+        else result_from_label(predicted_label)
+    )
 
     result_correct = expected_result == predicted_result
     label_correct = expected_label_norm == predicted_label_norm
@@ -247,6 +274,104 @@ def score_clip(clip: GoldenClip, play: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+async def analyze_clip_direct(clip: GoldenClip, blind: bool = False) -> dict[str, Any]:
+    """Run the production analyzer directly against an existing local clip."""
+    from main import (
+        CONFIDENCE_THRESHOLD,
+        _build_visual_evidence_async,
+        _predict_with_rules,
+        _result_from_label,
+        _retrieve_rules_async,
+    )
+
+    foul_hint = "" if blind else clip.expected_label
+    notes = "" if blind else clip.notes
+    video_bytes = await asyncio.to_thread(clip.video_path.read_bytes)
+    summary, broad_frame_count, focused_frame_count = await _build_visual_evidence_async(
+        video_bytes,
+        foul_hint=foul_hint,
+        notes=notes,
+        ruleset="high_school",
+    )
+    retrieval_query = "\n".join(
+        part for part in [summary, f"Foul hint: {foul_hint}" if foul_hint else "", notes] if part
+    )
+    retrieved = await _retrieve_rules_async(retrieval_query, top_k=6, ruleset="high_school")
+    label, confidence, explanation = await _predict_with_rules(
+        summary,
+        retrieved,
+        foul_hint=foul_hint,
+        notes=notes,
+        ruleset="high_school",
+    )
+    final_label = label if float(confidence) >= CONFIDENCE_THRESHOLD else "Uncertain"
+    scored = score_clip(clip, {
+        "id": f"local-{clip.clip_id}",
+        "status": "done",
+        "result": _result_from_label(final_label, float(confidence)),
+        "prediction_label": final_label,
+        "confidence": float(confidence),
+        "explanation": explanation,
+    })
+    scored["broad_frame_count"] = broad_frame_count
+    scored["focused_frame_count"] = focused_frame_count
+    return scored
+
+
+async def run_direct_clips(
+    clips: list[GoldenClip],
+    blind: bool,
+    concurrency: int,
+    report_path: Path,
+) -> list[dict[str, Any]]:
+    """Run local clips with bounded parallelism and keep report rows ordered."""
+    semaphore = asyncio.Semaphore(max(1, concurrency))
+
+    async def run_one(index: int, clip: GoldenClip):
+        async with semaphore:
+            print(f"\n[{index + 1}/{len(clips)}] Analyzing {clip.filename}", flush=True)
+            row = None
+            for attempt in range(1, 4):
+                try:
+                    row = await analyze_clip_direct(clip, blind=blind)
+                    break
+                except Exception as exc:
+                    transient = exc.__class__.__name__ in {
+                        "APIConnectionError",
+                        "APITimeoutError",
+                        "ConnectError",
+                        "ConnectTimeout",
+                        "ReadTimeout",
+                    }
+                    if not transient or attempt >= 3:
+                        raise
+                    wait_seconds = 2 ** attempt
+                    print(
+                        f"Transient API connection issue for {clip.filename}; "
+                        f"retrying in {wait_seconds} seconds ({attempt}/3).",
+                        flush=True,
+                    )
+                    await asyncio.sleep(wait_seconds)
+            if row is None:
+                raise RuntimeError(f"No result produced for {clip.filename}")
+            mark = "PASS" if row["result_correct"] and row["label_correct"] else "MISS"
+            print(
+                f"{mark}: expected {row['expected_result']} / {row['expected_label']}; "
+                f"got {row['predicted_result']} / {row['predicted_label']} "
+                f"({row['broad_frame_count']} broad + {row['focused_frame_count']} focused frames)",
+                flush=True,
+            )
+            return index, row
+
+    tasks = [asyncio.create_task(run_one(index, clip)) for index, clip in enumerate(clips)]
+    ordered: list[dict[str, Any] | None] = [None] * len(clips)
+    for task in asyncio.as_completed(tasks):
+        index, row = await task
+        ordered[index] = row
+        write_report(report_path, [item for item in ordered if item is not None])
+    return [item for item in ordered if item is not None]
+
+
 def write_report(path: Path, rows: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = [
@@ -263,6 +388,8 @@ def write_report(path: Path, rows: list[dict[str, Any]]) -> None:
         "overall_correct",
         "rule_reference",
         "confidence",
+        "broad_frame_count",
+        "focused_frame_count",
         "error_message",
         "explanation",
         "notes",
@@ -316,13 +443,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--poll-seconds", type=int, default=10)
     parser.add_argument("--limit", type=int, default=None, help="Run only the first N clips.")
     parser.add_argument("--ids", default="", help="Comma-separated clip ids to run, for example: 001,007,025.")
+    parser.add_argument(
+        "--blind",
+        action="store_true",
+        help="Withhold expected labels, results, and review notes from the analyzer.",
+    )
     parser.add_argument("--validate-only", action="store_true", help="Check labels/videos without uploading.")
+    parser.add_argument(
+        "--direct-local",
+        action="store_true",
+        help="Analyze existing local clips directly without uploading them to S3.",
+    )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=2,
+        help="Maximum clips analyzed at once in direct-local mode.",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    if not args.api_key and not args.validate_only:
+    if not args.api_key and not args.validate_only and not args.direct_local:
         print("DAVE_API_KEY is required. Set it in the environment or pass --api-key.", file=sys.stderr)
         return 2
 
@@ -341,16 +484,28 @@ def main() -> int:
     print(f"Labels: {args.labels}")
     print(f"Videos: {args.videos_dir}")
     print(f"Clips:  {len(clips)}")
+    print(f"Mode:   {'blind' if args.blind else 'label-assisted'}")
 
     if args.validate_only:
         print("Validation passed. No uploads were run.")
+        return 0
+
+    if args.direct_local:
+        print(f"Concurrency: {max(1, args.concurrency)}")
+        rows = asyncio.run(run_direct_clips(
+            clips,
+            blind=args.blind,
+            concurrency=args.concurrency,
+            report_path=args.report,
+        ))
+        print_summary(rows, args.report)
         return 0
 
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     rows: list[dict[str, Any]] = []
     for index, clip in enumerate(clips, start=1):
         print(f"\n[{index}/{len(clips)}] Uploading {clip.filename}")
-        upload_id = upload_clip(args.base_url, args.api_key, clip, run_id)
+        upload_id = upload_clip(args.base_url, args.api_key, clip, run_id, blind=args.blind)
         print(f"Upload id {upload_id}; waiting for result...")
         play = wait_for_result(args.base_url, args.api_key, upload_id, args.timeout_seconds, args.poll_seconds)
         scored = score_clip(clip, play)

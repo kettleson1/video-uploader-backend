@@ -26,17 +26,17 @@ from main import (
     BUCKET_NAME,
     _detect_play_segments_with_comparison,
     _extract_clip_bytes,
-    _extract_frames,
+    _screen_frames_async,
     _predict_batch_with_rules,
     _probe_video_duration,
     _retrieve_rules_async,
     _s3_key_from_url,
     _safe_err_text,
-    _summarize_frames_async,
     ensure_ruleset_columns,
     s3_client,
 )
 from models import Game, Play, PlayFinding, ProcessingJob, SegmentationComparison, Upload
+from video_frames import extract_timestamped_frames
 
 
 WORKER_CONCURRENCY = max(1, int(os.getenv("FULL_GAME_WORKER_CONCURRENCY", "4")))
@@ -44,7 +44,7 @@ CLAIM_BATCH_SIZE = max(WORKER_CONCURRENCY, int(os.getenv("FULL_GAME_CLAIM_BATCH_
 POLL_SECONDS = max(0.25, float(os.getenv("FULL_GAME_POLL_SECONDS", "2")))
 STALE_SECONDS = max(60, int(os.getenv("FULL_GAME_STALE_SECONDS", "900")))
 RETRY_SECONDS = max(1, int(os.getenv("FULL_GAME_RETRY_SECONDS", "15")))
-ANALYSIS_VERSION = "staged-multi-finding-v1"
+ANALYSIS_VERSION = "staged-multi-finding-v3-ball-exchange"
 
 
 def now_utc():
@@ -268,10 +268,14 @@ async def handle_screen_play(job: ProcessingJob):
             play.analysis_status = "screening"
             await db.commit()
             clip = await read_s3(play.clip_s3_url)
-            frames = await asyncio.to_thread(_extract_frames, clip, 1, 8)
-            play.broad_screen = await _summarize_frames_async(
-                frames, notes=play.notes or "", ruleset=game.ruleset
+            frames = await asyncio.to_thread(extract_timestamped_frames, clip, 1, 8)
+            if not frames:
+                raise RuntimeError("Play clip yielded no visual frames")
+            screening = await _screen_frames_async(
+                frames, duration=play.clip_end_time - play.clip_start_time,
+                notes=play.notes or "", ruleset=game.ruleset,
             )
+            play.broad_screen = screening["summary"]
         play.analysis_status = "queued_for_retrieval"
         play.updated_at = now_utc()
         await enqueue_job(

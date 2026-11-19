@@ -59,6 +59,14 @@ class NormalizeFindingsTests(unittest.TestCase):
         self.assertIn('@app.patch("/api/play-findings/{finding_id}/review")', source)
         self.assertIn('@app.post("/api/plays/{play_id}/findings")', source)
 
+    def test_analysis_prompt_requires_pass_and_holding_elements(self):
+        source = Path(__file__).with_name("main.py").read_text()
+        self.assertIn("never return offensive or defensive pass interference", source)
+        self.assertIn("if the play is a run or no forward pass is visible", source)
+        self.assertIn("Never return holding from contact or close engagement alone", source)
+        self.assertIn("require visible grasping, hooking, encircling, pulling, tackling", source)
+        self.assertIn("impedes an opponent beyond ordinary legal blocking", source)
+
 
 if __name__ == "__main__":
     unittest.main()
