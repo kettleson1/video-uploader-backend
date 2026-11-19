@@ -2,6 +2,14 @@
 
 Backend API for DAVE - Digital Artificial Video Evaluation. The service accepts high school football play videos, stores them in S3, extracts representative frames, uses OpenAI vision analysis to summarize the visible play action, retrieves likely NFHS rule snippets from Postgres/pgvector, and stores the AI prediction for human review.
 
+## Coaches-film MVP status
+
+As of November 19, 2026, the coaches-film development branch has completed a local end-to-end test. The React upload of Leyden–Morton created Game 5. The detector proposed 12 candidates. Removing a setup-only sequence and an incomplete final entry produced the same 10 boundaries as the official's saved review. The worker resumed queued work after restart and completed all 44 jobs. Every extracted clip played in the review screen.
+
+The official judged all 10 plays legal. DAVE returned eight no-foul results and flagged plays 4 and 9 as uncertain. Both involved forward handoffs. The quarterback also carried out a fake on play 9. The subsequent analyzer update asks DAVE to distinguish a hand-to-hand transfer from an airborne shovel pass and to mark a hidden exchange unclear. A film regression on these handoffs and a genuine short forward pass is pending.
+
+The separate 16-clip blind evaluation with focused review and 83 high-school rule snippets matched four foul/no-foul outcomes and two exact labels. It flagged two of seven clean controls as fouls. Officials retain responsibility for rulings and enforcement. The branch passed 34 backend tests at the handoff-guidance checkpoint. See the [backend agent guide](agents.md) for the analysis paths and verification commands.
+
 ## What This Service Does
 
 - Accepts uploaded football video clips from the frontend.
@@ -334,6 +342,6 @@ python3 -m py_compile main.py models.py database.py ingest_rules.py video_proces
 - Replace short rule snippets with fuller NFHS rule-book chunks.
 - Store the generated video summary on each upload for auditability.
 - Add automated tests for `/api/rules/search`, upload creation, retry, and review.
-- Move background processing to a real worker queue if upload volume increases.
+- Exercise the durable full-game queue on an unseen, full-length game after checking the handoff regression.
 - Add structured logging instead of `print` statements.
 - Consider wiring the richer `video_processor.py` pipeline into `main.py` once the current flow is stable.

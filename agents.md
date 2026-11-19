@@ -1,70 +1,19 @@
-## Agent Overview
+# DAVE backend agent guide
 
-This backend currently leans on three lightweight "agents" (small, single-responsibility LLM interactions) that orchestrate the automated review of uploaded football clips. They are defined in `main.py` and stitched together inside the `_process_upload_bg` pipeline.
+## Film analysis
 
-1. **Frame Summarizer (`_summarize_frames_async`)**
-   - **Input**: Up to six JPEG frames that `_extract_frames` pulls from each uploaded MP4 (1 FPS cap).
-   - **Model**: `OPENAI_CHAT_MODEL` (defaults to `gpt-4o-mini`) via `AsyncOpenAI`.
-   - **Prompting**: System prompt asks for a concise description of formation, motion, contact, and obvious infractions. The user message simply states how many frames were captured; raw images are *not* transmitted, so nothing sensitive leaves the box.
-   - **Output**: A ~70 word natural-language play summary. Downstream components treat this as ground truth context.
+The single-play upload path in `main.py` uses `_build_visual_evidence_async` to screen timestamped frames across a clip. When the screen nominates contact, a second pass samples around the event. Actual JPEG frames and prompt text go to OpenAI. Rule retrieval embeds the resulting description and searches PostgreSQL with pgvector. The description is a model observation that an official can correct.
 
-2. **Embedding Generator (`_embed_text`)**
-   - **Input**: Arbitrary text string.
-   - **Model**: `OPENAI_EMBED_MODEL` (defaults to `text-embedding-3-large`, 3,072 dims) via the embeddings endpoint. Used by both the runtime retrieval (`_retrieve_rules_async`) and the `ingest_rules.py` bootstrapper.
-   - **Output**: List of floats that represent the vectorized text. The async variant stores vectors in Postgres `vector(3072)` columns.
+For a full game, run `full_game_worker.py` alongside the API. The worker claims durable jobs from PostgreSQL, detects candidate boundaries, and waits for the timeline to be accepted for analysis. It extracts clips, screens up to eight timestamped frames per play, retrieves rules, evaluates multiple possible fouls, stores findings, and finalizes game counts. Preserve job keys, retry behavior, existing single-play records, and human reviews when changing these stages.
 
-3. **Rule-Aligned Predictor (`_predict_with_rules`)**
-   - **Input**: The play summary plus the `top_k` rule snippets returned from pgvector search. Snippets are formatted as bulleted text before prompting.
-   - **Model**: Same `OPENAI_CHAT_MODEL` configured above.
-   - **Prompting**: System prompt constrains behavior to “high school football rule assistant,” asking for JSON containing `{label, confidence, explanation}`. Confidence is a float in `[0,1]`.
-   - **Output**: Parsed JSON. The label is later thresholded (default `CONFIDENCE_THRESHOLD=0.60`) to optionally fall back to `Uncertain`. The explanation string is saved for UI transparency.
+## Ball exchanges
 
-## Data Flow Summary
+`ball_exchange.py` supplies guidance to broad screening, focused visual review, and both prediction paths. A direct handoff can move forward. For a short shovel pass, look for the ball traveling through the air. Trace the ball carrier separately from a quarterback carrying out a fake. If the transfer is hidden, record the exchange as unclear. An unclear exchange alone cannot support pass interference.
 
-```
-Upload -> S3 -> DB row (queued)
-            \
-             -> `_process_upload_bg` task
-                    1. `_extract_frames`
-                    2. `_summarize_frames_async`  (Agent 1)
-                    3. `_retrieve_rules_async`
-                       └─ `_embed_text`          (Agent 2)
-                    4. `_predict_with_rules`      (Agent 3)
-                    5. Persist prediction + retrieved rule snippets
-```
+## Verification
 
-All long-running work stays off the request/response path thanks to `asyncio.create_task` inside `/upload`. Retries call the same worker via `/api/retry/{upload_id}`.
+Run `python -m unittest discover -q` in the backend environment. For an end-to-end check, use the isolated local database and dedicated test bucket, submit film from the React screen, compare boundaries against the saved review, reload, and verify clip playback and completed jobs.
 
-## Supporting Scripts
+Use `eval_golden_dataset.py --direct-local --blind` with a configured test database for blind clip analysis. This path reads local videos and still calls OpenAI. Ensure the intended ruleset has populated rule embeddings before comparing predictions. Score the foul disposition and exact label separately. Keep official notes and expected outcomes out of the model inputs.
 
-- `ingest_rules.py` ingests every `rules/*.txt` file, calls `_embed_text`, and upserts the vectors into Postgres (requires the `vector` extension and `uq_rules_title_section` unique index). Run it whenever rule text changes.
-- `rules/` contains the canonical snippets used both for retrieval and for the predictor to cite in explanations.
-
-## Extending the Agent Layer
-
-- **Adding new models**: Introduce new env vars (e.g., `OPENAI_VISION_MODEL`) and thread them through the helper responsible for that step. Keep prompts alongside code for easy auditing.
-- **Changing prompts**: Update the static strings inside `_summarize_frames_async` or `_predict_with_rules`. Because those strings live in code, remember to re-run regression tests or at minimum submit a QA clip before deploying.
-- **More context**: If you want to feed audio transcripts or telemetry into the predictor, enrich the summary string before the retrieval step—no DB changes needed unless storing the extra context.
-- **Observability**: Each stage logs an emoji-tagged line; expand this with structured logging if you need dashboards.
-
-## Operational Notes
-
-- Secrets: `AWS_S3_BUCKET`, `DATABASE_URL`, and `OPENAI_API_KEY` must be defined (see `.env`). Missing values will raise during app startup.
-- Confidence fallback: The user-facing `prediction_label` becomes `Uncertain` when `confidence < CONFIDENCE_THRESHOLD`. Adjust via env var rather than editing code so that Airflow/infra can override per environment.
-- Human review: `/api/review/{upload_id}` and `/api/plays/{upload_id}/review` let reviewers correct predictions. Those handlers never call an agent; they simply patch DB columns (`human_label`, `human_notes`, `reviewed_at`).
-
-## Golden Dataset Notes
-
-The repository now includes `golden-dataset/` metadata for the NFHS high-school golden evaluation set. The metadata tracks candidate source videos, approved labels, expected results, rule references, and reviewer notes.
-
-The actual video clips are intentionally not tracked in git. They should live locally in `golden-dataset/videos/` with filenames matching `labels.csv`.
-
-Current approved clips:
-
-- `002_obvious_dpi_early_contact.mov`: defensive pass interference, foul, DPI category `early_contact`.
-- `003_borderline_dpi_arm_restrict.mov`: defensive pass interference, foul, DPI category `arm_bar/body_restrict`.
-- `004_no_foul_no_pass_interference.mov`: no foul, negative-control pass-interference review clip.
-
-For MVP 1, score only the main label/result, such as `pass_interference_defense` versus `None`. DPI subcategories such as `early_contact`, `arm_bar`, `not_playing_the_ball`, `hook_and_turn`, `cutoff`, and `playing_through` should stay in notes until a later eval version adds subtype scoring.
-
-Use this document as the canonical reference before tweaking prompts, swapping models, or inserting additional LLM calls.
+See the [backend status](README.md#coaches-film-mvp-status) for the measured results and the pending film regression.
