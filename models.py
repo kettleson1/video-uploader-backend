@@ -6,6 +6,8 @@ from database import Base   # ✅ Base correctly imported from db setup
 class Upload(Base):
     __tablename__ = "uploads"
 
+    owner_sub = Column(Text, index=True)
+
     id = Column(BigInteger, primary_key=True)
     game_id = Column(BigInteger, index=True)
     play_number = Column(Integer)
@@ -53,6 +55,8 @@ class Rule(Base):
 
 class Game(Base):
     __tablename__ = "games"
+
+    owner_sub = Column(Text, index=True)
 
     id = Column(BigInteger, primary_key=True)
     title = Column(Text)

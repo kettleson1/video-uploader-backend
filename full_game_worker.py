@@ -388,7 +388,8 @@ async def handle_store_findings(job: ProcessingJob):
             upload.retrieved_rules = play.retrieved_rules
             upload.processed_at = now_utc()
         await db.flush()
-        game = await db.get(Game, play.game_id)
+        # Serialize progress counts so concurrent last plays see each other's commits.
+        game = await db.get(Game, play.game_id, with_for_update=True)
         terminal_count = await db.scalar(
             select(func.count()).select_from(Play).where(
                 Play.game_id == play.game_id,
@@ -465,6 +466,7 @@ async def process_job(job: ProcessingJob):
                         play.error_message = _safe_err_text(error)
                         play.updated_at = now_utc()
                         await db.flush()
+                        await db.get(Game, play.game_id, with_for_update=True)
                         await enqueue_finalize_if_ready(db, play.game_id)
                 game = await db.get(Game, job.game_id)
                 if game and not job.play_id:

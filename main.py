@@ -30,7 +30,7 @@ from video_frames import (
 )
 
 import boto3
-from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, Query, Body, HTTPException, Depends, Header
+from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, Query, Body, HTTPException, Depends, Header, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, func, or_
@@ -128,6 +128,9 @@ app.add_middleware(
 @app.on_event("startup")
 def ensure_ruleset_columns():
     with engine.begin() as conn:
+        # The API and worker can start together on a fresh installation.
+        conn.execute(sqltext("SELECT pg_advisory_xact_lock(hashtext('dave_film_schema'))"))
+        Upload.__table__.create(conn, checkfirst=True)
         conn.execute(sqltext("""
             CREATE TABLE IF NOT EXISTS games (
                 id BIGSERIAL PRIMARY KEY,
@@ -147,6 +150,10 @@ def ensure_ruleset_columns():
             )
         """))
         conn.execute(sqltext("ALTER TABLE IF EXISTS uploads ADD COLUMN IF NOT EXISTS ruleset TEXT NOT NULL DEFAULT 'high_school'"))
+        conn.execute(sqltext("ALTER TABLE games ADD COLUMN IF NOT EXISTS owner_sub TEXT"))
+        conn.execute(sqltext("ALTER TABLE uploads ADD COLUMN IF NOT EXISTS owner_sub TEXT"))
+        conn.execute(sqltext("CREATE INDEX IF NOT EXISTS ix_games_owner_sub ON games (owner_sub)"))
+        conn.execute(sqltext("CREATE INDEX IF NOT EXISTS ix_uploads_owner_sub ON uploads (owner_sub)"))
         conn.execute(sqltext("ALTER TABLE IF EXISTS uploads ADD COLUMN IF NOT EXISTS game_id BIGINT"))
         conn.execute(sqltext("ALTER TABLE IF EXISTS uploads ADD COLUMN IF NOT EXISTS play_number INTEGER"))
         conn.execute(sqltext("ALTER TABLE IF EXISTS uploads ADD COLUMN IF NOT EXISTS start_time DOUBLE PRECISION"))
@@ -357,17 +364,66 @@ def _decode_session_token(token: str) -> Optional[dict]:
 
 
 def require_api_key(
+    response: Response,
     x_dave_api_key: Optional[str] = Header(None, alias="X-DAVE-API-Key"),
     authorization: Optional[str] = Header(None, alias="Authorization"),
-):
+) -> Optional[str]:
+    """Return a signed member ID, or None for a verified server administrator."""
+    response.headers["Cache-Control"] = "private, no-store"
     if not DAVE_API_KEY:
         raise HTTPException(status_code=503, detail="API authentication is not configured")
     if x_dave_api_key and secrets.compare_digest(x_dave_api_key, DAVE_API_KEY):
         return
     if authorization and authorization.startswith("Bearer "):
-        if _decode_session_token(authorization[7:].strip()):
-            return
+        payload = _decode_session_token(authorization[7:].strip())
+        if payload:
+            return str(payload["sub"])
     raise HTTPException(status_code=401, detail="Invalid or missing API authorization")
+
+
+def upload_owner_filter(member: str):
+    owned_games = select(Game.id).where(Game.owner_sub == member)
+    return or_(
+        Upload.game_id.in_(owned_games),
+        (Upload.game_id.is_(None)) & (Upload.owner_sub == member),
+    )
+
+
+async def require_game_access(game_id: int, db=Depends(get_db), member=Depends(require_api_key)):
+    if member is not None and not await db.scalar(
+        select(Game.id).where(Game.id == game_id, Game.owner_sub == member)
+    ):
+        raise HTTPException(404, "Game not found")
+
+
+async def require_play_access(play_id: int, db=Depends(get_db), member=Depends(require_api_key)):
+    if member is not None and not await db.scalar(
+        select(Play.id).join(Game, Play.game_id == Game.id)
+        .where(Play.id == play_id, Game.owner_sub == member)
+    ):
+        raise HTTPException(404, "Play not found")
+
+
+async def require_finding_access(finding_id: int, db=Depends(get_db), member=Depends(require_api_key)):
+    if member is not None and not await db.scalar(
+        select(PlayFinding.id).join(Play, PlayFinding.play_id == Play.id)
+        .join(Game, Play.game_id == Game.id)
+        .where(PlayFinding.id == finding_id, Game.owner_sub == member)
+    ):
+        raise HTTPException(404, "Finding not found")
+
+
+async def require_upload_access(upload_id: int, db=Depends(get_db), member=Depends(require_api_key)):
+    if member is not None and not await db.scalar(
+        select(Upload.id).where(Upload.id == upload_id, upload_owner_filter(member))
+    ):
+        raise HTTPException(404, "Upload not found")
+
+
+def require_admin(member=Depends(require_api_key)):
+    if member is not None:
+        raise HTTPException(403, "Administrator access required")
+
 
 @app.get("/api/rules/list")
 async def list_rules(
@@ -1599,18 +1655,21 @@ async def upload_game_video(
     title: str = Form(""),
     ruleset: str = Form("high_school"),
     db: AsyncSession = Depends(get_db),
-    _auth: None = Depends(require_api_key),
+    member: Optional[str] = Depends(require_api_key),
 ):
     try:
         ruleset = _normalize_ruleset(ruleset)
-        data = await file.read()
         clean_name = re.sub(r"[^A-Za-z0-9._-]+", "_", file.filename or "game.mp4")
         stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S%fZ")
-        key = f"games/{stamp}_{clean_name}"
-        s3_client.put_object(Bucket=BUCKET_NAME, Key=key, Body=data, ContentType=file.content_type or "video/mp4")
+        key = f"games/{stamp}_{secrets.token_hex(8)}_{clean_name}"
+        await asyncio.to_thread(
+            s3_client.upload_fileobj, file.file, BUCKET_NAME, key,
+            ExtraArgs={"ContentType": file.content_type or "video/mp4"},
+        )
         s3_url = f"https://{BUCKET_NAME}.s3.{AWS_REGION}.amazonaws.com/{key}"
 
         rec = Game(
+            owner_sub=member,
             title=title.strip() or clean_name,
             source_type="file",
             source_url=None,
@@ -1639,18 +1698,21 @@ async def list_games(
     offset: int = Query(0, ge=0),
     ruleset: str = Query("high_school"),
     db: AsyncSession = Depends(get_db),
-    _auth: None = Depends(require_api_key),
+    member: Optional[str] = Depends(require_api_key),
 ):
     ruleset = _normalize_ruleset(ruleset)
+    filters = [Game.ruleset == ruleset]
+    if member is not None:
+        filters.append(Game.owner_sub == member)
     result = await db.execute(
         select(Game)
-        .where(Game.ruleset == ruleset)
+        .where(*filters)
         .order_by(Game.id.desc())
         .offset(offset)
         .limit(limit)
     )
     rows = result.scalars().all()
-    total_result = await db.execute(select(func.count()).select_from(Game).where(Game.ruleset == ruleset))
+    total_result = await db.execute(select(func.count()).select_from(Game).where(*filters))
     return {
         "items": [_game_to_dict(row) for row in rows],
         "total": total_result.scalar_one(),
@@ -1662,7 +1724,7 @@ async def list_games(
 @app.get("/api/migration/readiness")
 async def get_migration_readiness(
     db: AsyncSession = Depends(get_db),
-    _auth: None = Depends(require_api_key),
+    _auth: None = Depends(require_admin),
 ):
     game_count = await db.scalar(select(func.count()).select_from(Game)) or 0
     comparison_count = await db.scalar(
@@ -1718,7 +1780,7 @@ async def get_migration_readiness(
 async def get_game_segmentation_comparison(
     game_id: int,
     db: AsyncSession = Depends(get_db),
-    _auth: None = Depends(require_api_key),
+    _auth: None = Depends(require_game_access),
 ):
     game = await db.get(Game, game_id)
     if not game:
@@ -1780,7 +1842,7 @@ async def get_game_segmentation_comparison(
 async def get_game(
     game_id: int,
     db: AsyncSession = Depends(get_db),
-    _auth: None = Depends(require_api_key),
+    _auth: None = Depends(require_game_access),
 ):
     result = await db.execute(select(Game).where(Game.id == game_id))
     game = result.scalar_one_or_none()
@@ -1797,7 +1859,7 @@ async def get_game_plays(
     result: Optional[str] = Query(None),
     reviewed: Optional[bool] = Query(None),
     db: AsyncSession = Depends(get_db),
-    _auth: None = Depends(require_api_key),
+    _auth: None = Depends(require_game_access),
 ):
     filters = [Upload.game_id == game_id]
     if result:
@@ -1845,7 +1907,7 @@ async def get_game_plays(
 async def get_game_timeline(
     game_id: int,
     db: AsyncSession = Depends(get_db),
-    _auth: None = Depends(require_api_key),
+    _auth: None = Depends(require_game_access),
 ):
     game_result = await db.execute(select(Game).where(Game.id == game_id))
     game = game_result.scalar_one_or_none()
@@ -1953,7 +2015,7 @@ async def update_game_segments(
     game_id: int,
     payload: SegmentsPayload,
     db: AsyncSession = Depends(get_db),
-    _auth: None = Depends(require_api_key),
+    _auth: None = Depends(require_game_access),
 ):
     game_result = await db.execute(select(Game).where(Game.id == game_id))
     game = game_result.scalar_one_or_none()
@@ -2022,7 +2084,7 @@ async def review_play_finding(
     finding_id: int,
     payload: FindingReviewPayload,
     db: AsyncSession = Depends(get_db),
-    _auth: None = Depends(require_api_key),
+    _auth: None = Depends(require_finding_access),
 ):
     finding = await db.get(PlayFinding, finding_id)
     if not finding:
@@ -2083,7 +2145,7 @@ async def update_play_boundary(
     play_id: int,
     payload: PlayBoundaryPayload,
     db: AsyncSession = Depends(get_db),
-    _auth: None = Depends(require_api_key),
+    _auth: None = Depends(require_game_access),
 ):
     game = await db.get(Game, game_id)
     play = await db.get(Play, play_id)
@@ -2129,7 +2191,7 @@ async def split_game_play(
     play_id: int,
     payload: PlaySplitPayload,
     db: AsyncSession = Depends(get_db),
-    _auth: None = Depends(require_api_key),
+    _auth: None = Depends(require_game_access),
 ):
     game = await db.get(Game, game_id)
     play = await db.get(Play, play_id)
@@ -2214,7 +2276,7 @@ async def merge_game_plays(
     play_id: int,
     payload: PlayMergePayload,
     db: AsyncSession = Depends(get_db),
-    _auth: None = Depends(require_api_key),
+    _auth: None = Depends(require_game_access),
 ):
     game = await db.get(Game, game_id)
     play = await db.get(Play, play_id)
@@ -2269,7 +2331,7 @@ async def reanalyze_game_play(
     game_id: int,
     play_id: int,
     db: AsyncSession = Depends(get_db),
-    _auth: None = Depends(require_api_key),
+    _auth: None = Depends(require_game_access),
 ):
     game = await db.get(Game, game_id)
     play = await db.get(Play, play_id)
@@ -2287,7 +2349,7 @@ async def remove_game_play(
     game_id: int,
     play_id: int,
     db: AsyncSession = Depends(get_db),
-    _auth: None = Depends(require_api_key),
+    _auth: None = Depends(require_game_access),
 ):
     game = await db.get(Game, game_id)
     play = await db.get(Play, play_id)
@@ -2320,7 +2382,7 @@ async def add_manual_play_finding(
     play_id: int,
     payload: ManualFindingPayload,
     db: AsyncSession = Depends(get_db),
-    _auth: None = Depends(require_api_key),
+    _auth: None = Depends(require_play_access),
 ):
     play = await db.get(Play, play_id)
     if not play:
@@ -2381,7 +2443,7 @@ async def add_manual_play_finding(
 async def analyze_game(
     game_id: int,
     db: AsyncSession = Depends(get_db),
-    _auth: None = Depends(require_api_key),
+    _auth: None = Depends(require_game_access),
 ):
     game_result = await db.execute(select(Game).where(Game.id == game_id))
     game = game_result.scalar_one_or_none()
@@ -2422,7 +2484,7 @@ async def upload_video(
     notes: str = Form(""),
     ruleset: str = Form("high_school"),
     db: AsyncSession = Depends(get_db),
-    _auth: None = Depends(require_api_key),
+    member: Optional[str] = Depends(require_api_key),
 ):
     print("📥 Upload request received")
 
@@ -2450,6 +2512,7 @@ async def upload_video(
         # DB Write (async)
         try:
             rec = Upload(
+                owner_sub=member,
                 s3_url=s3_url,
                 foul_type=foul_type,
                 notes=notes,
@@ -2485,12 +2548,14 @@ async def list_recent_plays(
     q: Optional[str] = Query(None, min_length=1),
     ruleset: str = Query("high_school"),
     db: AsyncSession = Depends(get_db),
-    _auth: None = Depends(require_api_key),
+    member: Optional[str] = Depends(require_api_key),
 ):
     try:
         ruleset = _normalize_ruleset(ruleset)
         filters = []
         filters.append(Upload.ruleset == ruleset)
+        if member is not None:
+            filters.append(upload_owner_filter(member))
         if status:
             filters.append(Upload.status == status)
         if reviewed is not None:
@@ -2575,7 +2640,7 @@ def health_check():
 async def retry_upload(
     upload_id: int,
     db: AsyncSession = Depends(get_db),
-    _auth: None = Depends(require_api_key),
+    _auth: None = Depends(require_upload_access),
 ):
     """Mark upload queued and re-run async background worker."""
     # Fetch the row using async session
@@ -2606,7 +2671,7 @@ async def retry_upload(
 def set_human_review(
     upload_id: int,
     payload: ReviewPayload,
-    _auth: None = Depends(require_api_key),
+    _auth: None = Depends(require_upload_access),
 ):
     db: Session = SessionLocal()
     try:
@@ -2633,7 +2698,7 @@ def set_human_review(
 def submit_official_feedback(
     upload_id: int,
     payload: OfficialFeedbackIn,
-    _auth: None = Depends(require_api_key),
+    _auth: None = Depends(require_upload_access),
 ):
     """
     Save a low-friction official feedback signal without replacing the AI prediction.
@@ -2728,7 +2793,7 @@ class ReviewIn(BaseModel):
 def submit_review(
     upload_id: int,
     payload: ReviewIn = Body(...),
-    _auth: None = Depends(require_api_key),
+    _auth: None = Depends(require_upload_access),
 ):
     """
     Save human review info. If override_prediction=True and human_label is provided,

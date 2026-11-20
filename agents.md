@@ -10,6 +10,10 @@ For a full game, run `full_game_worker.py` alongside the API. The worker claims 
 
 `ball_exchange.py` supplies guidance to broad screening, focused visual review, and both prediction paths. A direct handoff can move forward. For a short shovel pass, look for the ball traveling through the air. Trace the ball carrier separately from a quarterback carrying out a fake. If the transfer is hidden, record the exchange as unclear. An unclear exchange alone cannot support pass interference.
 
+## Member access
+
+Use the signed WordPress subject as the owner of a new game or standalone upload. A game clip inherits access from its parent game. Enforce ownership before returning clips, signing playback URLs, or changing any review or job. Older rows without an owner are accessible with the server administrator key. Keep the key on the server. Run the two-member HTTP regression by setting `DAVE_PRIVACY_TEST_DATABASE_URL` to a disposable PostgreSQL database initialized with the DAVE schema.
+
 ## Verification
 
 Run `python -m unittest discover -q` in the backend environment. For an end-to-end check, use the isolated local database and dedicated test bucket, submit film from the React screen, compare boundaries against the saved review, reload, and verify clip playback and completed jobs.

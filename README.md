@@ -4,9 +4,11 @@ Backend API for DAVE - Digital Artificial Video Evaluation. The service accepts 
 
 ## Coaches-film MVP status
 
-As of November 19, 2026, the coaches-film development branch has completed a local end-to-end test. The React upload of Leyden–Morton created Game 5. The detector proposed 12 candidates. Removing a setup-only sequence and an incomplete final entry produced the same 10 boundaries as the official's saved review. The worker resumed queued work after restart and completed all 44 jobs. Every extracted clip played in the review screen.
+On November 19, 2026, the coaches-film development branch has completed a local end-to-end test. The React upload of Leyden–Morton created Game 5. The detector proposed 12 candidates. Removing a setup-only sequence and an incomplete final entry produced the same 10 boundaries as the official's saved review. The worker resumed queued work after restart and completed all 44 jobs. Every extracted clip played in the review screen.
 
-The official judged all 10 plays legal. DAVE returned eight no-foul results and flagged plays 4 and 9 as uncertain. Both involved forward handoffs. The quarterback also carried out a fake on play 9. The subsequent analyzer update asks DAVE to distinguish a hand-to-hand transfer from an airborne shovel pass and to mark a hidden exchange unclear. A film regression on these handoffs and a genuine short forward pass is pending.
+The official judged all 10 plays legal. DAVE returned eight no-foul results and flagged plays 4 and 9 as uncertain. Both involved forward handoffs. The quarterback also carried out a fake on play 9. The subsequent analyzer update asks DAVE to distinguish a hand-to-hand transfer from an airborne shovel pass and to mark a hidden exchange unclear. The genuine short forward pass control is still pending.
+
+On November 20, two WordPress subscriber sessions verified uploader-private access against the local API. Member Game 6 used the dedicated S3 test bucket. Shadow mode initially selected four legacy windows. From its twelve play-first candidates we submitted the ten boundaries matching the official reference. All 44 jobs completed and the uploader could retrieve every clip. A second member could neither open the timeline nor change findings. The model returned nine no-foul results, including plays 4 and 9. It flagged play 8 as uncertain for offensive pass interference despite the official's no-foul review. Full-length game capacity and accuracy on unseen film still need testing.
 
 The separate 16-clip blind evaluation with focused review and 83 high-school rule snippets matched four foul/no-foul outcomes and two exact labels. It flagged two of seven clean controls as fouls. Officials retain responsibility for rulings and enforcement. The branch passed 34 backend tests at the handoff-guidance checkpoint. See the [backend agent guide](agents.md) for the analysis paths and verification commands.
 
@@ -87,21 +89,11 @@ The database must have pgvector available. `ingest_rules.py` creates the `rules`
 
 ## API Authentication
 
-All application API routes require this request header:
+WordPress members use a short-lived bearer token signed by the plugin. The API records its signed user ID on each new game or standalone upload. Game lists, playback links, findings, and edits are scoped to that member. Historical records with unknown ownership stay available to the server administrator. A playback URL gives its holder temporary access until it expires.
 
-```text
-X-DAVE-API-Key: <DAVE_API_KEY>
-```
+The server-side `DAVE_API_KEY` also grants administrative access through the `X-DAVE-API-Key` header. Use a different random secret of at least 32 characters for each WordPress installation and its paired API. Keep it out of browser bundles. The public health check is `/health`.
 
-The `/health` route remains public so uptime checks can work without credentials.
-
-Generate a local key with:
-
-```bash
-python3 -c "import secrets; print(secrets.token_urlsafe(32))"
-```
-
-Use the same value in the frontend as `REACT_APP_DAVE_API_KEY`.
+For an isolated staging installation, configure the staging database, private bucket, server keys, and WordPress origin. Populate the high-school rules with `ingest_rules.py`. Start both `uvicorn main:app` and `python full_game_worker.py` against the same staging configuration. Set `PLAY_DETECTOR_MODE=coaches_activity` on the staging worker to exercise the play-first timeline. The default shadow comparison selects legacy windows until play-first is accepted. Size the upload proxy limit, timeout, temporary disk, and worker memory against a representative full-length game.
 
 ## Local Setup
 
