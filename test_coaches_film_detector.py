@@ -5,6 +5,8 @@ from coaches_film_detector import (
     detect_cutup_play_boundaries,
     detect_play_boundaries,
     find_uncovered_intervals,
+    select_play_candidates,
+    reviewed_boundary_flags,
 )
 from segmentation_comparison import compare_segmentations, interval_iou
 
@@ -47,6 +49,23 @@ class DetectPlayBoundariesTests(unittest.TestCase):
         )
 
         self.assertEqual(result, [])
+
+    def test_sparse_fades_fall_back_to_motion(self):
+        transitions = [{"start_time": t, "end_time": t} for t in (5, 10)]
+        activity = samples([0.5] * 40 + [12] * 10 + [0.5] * 200)
+        result = select_play_candidates(transitions, 125, activity)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["detection_method"], "coaches_activity")
+        self.assertLess(result[0]["end_time"], 60)
+
+    def test_unresolved_long_clip_stays_visible(self):
+        transitions = [{"start_time": t, "end_time": t} for t in (5, 10)]
+        result = select_play_candidates(transitions, 125, [])
+        self.assertEqual(len(result), 3)
+        self.assertIn("clip_too_long", result[-1]["boundary_flags"])
+        self.assertLessEqual(result[-1]["segment_confidence"], 0.3)
+        self.assertEqual(reviewed_boundary_flags(result[-1]["boundary_flags"], 10, 70),
+                         ["cut_up_transition_segmentation"])
 
     def test_detects_and_numbers_separate_activity_runs(self):
         scores = [0.5] * 20 + [12.0] * 12 + [0.5] * 30 + [10.0] * 10 + [0.5] * 10

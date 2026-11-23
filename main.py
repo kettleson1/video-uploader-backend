@@ -13,8 +13,10 @@ from datetime import datetime, timezone
 from typing import List, Optional
 from models import Game, Play, PlayFinding, ProcessingJob, SegmentationComparison, Upload, Rule
 from coaches_film_detector import (
-    detect_cutup_play_boundaries,
-    detect_play_boundaries,
+    MAX_PLAY_CLIP_SECONDS,
+    clip_too_long,
+    reviewed_boundary_flags,
+    select_play_candidates,
     extract_activity_samples,
     extract_black_intervals,
     find_uncovered_intervals,
@@ -578,7 +580,28 @@ async def _reset_play_for_reanalysis(db: AsyncSession, play: Play, clear_clip: b
             if game:
                 upload.s3_url = game.s3_url
 
+def play_clip_bounds(play):
+    start = play.clip_start_time if play.clip_start_time is not None else play.source_start_time
+    end = play.clip_end_time if play.clip_end_time is not None else play.source_end_time
+    return start, end
+
+
+async def long_clip_message(db, game_id):
+    duration = (func.coalesce(Play.clip_end_time, Play.source_end_time)
+                - func.coalesce(Play.clip_start_time, Play.source_start_time))
+    numbers = (await db.scalars(select(Play.play_number).where(
+        Play.game_id == game_id, duration > MAX_PLAY_CLIP_SECONDS
+    ).order_by(Play.play_number))).all()
+    if numbers:
+        return (f"Split, shorten, or remove clips longer than {MAX_PLAY_CLIP_SECONDS} seconds "
+                f"before analysis. Check play numbers {', '.join(map(str, numbers))}.")
+
+
 async def _enqueue_selective_analysis(db: AsyncSession, game: Game):
+    await db.flush()
+    if await long_clip_message(db, game.id):
+        game.status = "segments_ready"
+        return
     signature_result = await db.execute(
         select(Play.id, Play.source_start_time, Play.source_end_time, Play.analysis_revision)
         .where(Play.game_id == game.id)
@@ -676,9 +699,7 @@ def _detect_play_segments_with_comparison(video_bytes: bytes):
     try:
         samples = extract_activity_samples(video_bytes)
         black_intervals = extract_black_intervals(video_bytes)
-        play_first = detect_cutup_play_boundaries(
-            black_intervals, duration, samples=samples
-        ) or detect_play_boundaries(samples, duration)
+        play_first = select_play_candidates(black_intervals, duration, samples)
     except Exception as error:
         if PLAY_DETECTOR_MODE not in {"coaches_activity_with_fallback", "shadow_compare"}:
             raise
@@ -1328,7 +1349,8 @@ def _play_to_dict(
         "segment_confidence": play.segment_confidence,
         "timeline_play_id": timeline_play.id if timeline_play else None,
         "detection_method": timeline_play.detection_method if timeline_play else None,
-        "boundary_flags": (timeline_play.boundary_flags or []) if timeline_play else [],
+        "boundary_flags": (reviewed_boundary_flags(timeline_play.boundary_flags, *play_clip_bounds(timeline_play))
+                           if timeline_play else reviewed_boundary_flags([], play.start_time, play.end_time)),
         "snap_time": timeline_play.snap_time if timeline_play else None,
         "live_ball_end_time": timeline_play.live_ball_end_time if timeline_play else None,
         "foul_type": play.foul_type,
@@ -1956,7 +1978,7 @@ async def get_game_timeline(
             ),
             "detection_method": play.detection_method,
             "detection_confidence": play.detection_confidence,
-            "boundary_flags": play.boundary_flags or [],
+            "boundary_flags": reviewed_boundary_flags(play.boundary_flags, *play_clip_bounds(play)),
             "boundary_review_status": play.boundary_review_status,
             "original_start_time": play.original_start_time,
             "original_end_time": play.original_end_time,
@@ -2338,6 +2360,9 @@ async def reanalyze_game_play(
     if not game or not play or play.game_id != game_id:
         raise HTTPException(status_code=404, detail="Game play not found")
     _assert_game_editable(game)
+    message = await long_clip_message(db, game_id)
+    if message:
+        raise HTTPException(409, message)
     await _reset_play_for_reanalysis(db, play, clear_clip=False)
     await _enqueue_selective_analysis(db, game)
     await db.commit()
@@ -2451,6 +2476,9 @@ async def analyze_game(
         raise HTTPException(status_code=404, detail="Game not found")
     if game.status in {"queued_for_analysis", "analyzing"}:
         return {"ok": True, "id": game_id, "status": game.status}
+    message = await long_clip_message(db, game_id)
+    if message:
+        raise HTTPException(409, message)
     play_count_result = await db.execute(
         select(func.count()).select_from(Upload).where(Upload.game_id == game_id)
     )
@@ -2649,6 +2677,9 @@ async def retry_upload(
 
     if not row:
         return {"ok": False, "error": "Not found"}
+
+    if row.game_id and (not row.clip_s3_url or clip_too_long(row.start_time, row.end_time)):
+        raise HTTPException(409, "Review this clip’s boundaries in the game timeline before analysis.")
 
     # Update status and clear error/processed flags
     row.status = "queued"

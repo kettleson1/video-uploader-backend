@@ -9,6 +9,7 @@ import os
 import secrets
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -56,6 +57,26 @@ class MemberFilmTests(unittest.TestCase):
             self.assertEqual(listing.json()["items"][0]["id"], response.json()["id"])
         game = client.get(games, headers=owner).json()["items"][0]
         path = f"{games}/{game['id']}"
+        long_segment = {"segments": [{"start_time": 0, "end_time": 61}]}
+        self.assertEqual(client.patch(path + "/segments", headers=owner, json=long_segment).status_code, 200)
+        timeline = client.get(path + "/timeline", headers=owner).json()
+        long_play = timeline["items"][0]
+        self.assertIn("clip_too_long", long_play["boundary_flags"])
+        # A previously queued extraction must observe the same rule after restart.
+        from full_game_worker import handle_extract_clips
+        with patch("full_game_worker.read_s3") as read_film:
+            client.portal.call(handle_extract_clips, SimpleNamespace(game_id=game["id"]))
+            read_film.assert_not_awaited()
+        self.assertEqual(client.post(path + "/analyze", headers=owner).status_code, 409)
+        play_route = path + f"/plays/{long_play['id']}"
+        self.assertEqual(client.post(play_route + "/reanalyze", headers=owner).status_code, 409)
+        client.patch(play_route + "/boundary", headers=owner, json={"start_time": 0, "end_time": 62}).raise_for_status()
+        timeline = client.get(path + "/timeline", headers=owner).json()
+        self.assertFalse(any(job["stage"] == "extract_clips" for job in timeline["jobs"]))
+        client.patch(play_route + "/boundary", headers=owner, json={"start_time": 2, "end_time": 62}).raise_for_status()
+        timeline = client.get(path + "/timeline", headers=owner).json()
+        self.assertNotIn("clip_too_long", timeline["items"][0]["boundary_flags"])
+        self.assertTrue(any(job["stage"] == "extract_clips" for job in timeline["jobs"]))
         segments = {"segments": [{"start_time": 0, "end_time": 10}]}
         self.assertEqual(client.patch(path + "/segments", headers=owner, json=segments).status_code, 200)
         play = client.get(path + "/timeline", headers=owner).json()["items"][0]

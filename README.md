@@ -12,6 +12,8 @@ On November 20, two WordPress subscriber sessions verified uploader-private acce
 
 The separate 16-clip blind evaluation with focused review and 83 high-school rule snippets matched four foul/no-foul outcomes and two exact labels. It flagged two of seven clean controls as fouls. Officials retain responsibility for rulings and enforcement. The branch passed 34 backend tests at the handoff-guidance checkpoint. See the [backend agent guide](agents.md) for the analysis paths and verification commands.
 
+The play-first detector treats a padded clip over 60 seconds as needing boundary review. If those clips cover more than half of a timeline derived from black transitions, it tries motion detection. If motion yields no candidates, the transition timeline stays available for correction. The review screen identifies oversized clips, and game analysis can proceed once they have been shortened, split, or removed. The same limit applies to saved games when their timelines are reopened.
+
 ## What This Service Does
 
 - Accepts uploaded football video clips from the frontend.

@@ -30,6 +30,42 @@ BLACK_INTERVAL_PATTERN = re.compile(
 )
 
 
+# Includes pre-snap and post-play padding.
+MAX_PLAY_CLIP_SECONDS = 60
+LONG_CLIP_FLAG = "clip_too_long"
+
+
+def clip_too_long(start, end):
+    return start is not None and end is not None and end - start > MAX_PLAY_CLIP_SECONDS
+
+
+def reviewed_boundary_flags(flags, start, end):
+    current = [flag for flag in (flags or []) if flag != LONG_CLIP_FLAG]
+    if clip_too_long(start, end):
+        current.append(LONG_CLIP_FLAG)
+    return current
+
+
+def select_play_candidates(black_intervals, duration, samples):
+    candidates = detect_cutup_play_boundaries(black_intervals, duration, samples)
+    oversized_seconds = sum(
+        clip["end_time"] - clip["start_time"] for clip in candidates
+        if clip_too_long(clip["start_time"], clip["end_time"])
+    )
+    # A few broadcast fades can put most of the game in multi-minute clips.
+    if not candidates or oversized_seconds > duration / 2:
+        motion = detect_play_boundaries(samples, duration)
+        if motion:
+            candidates = motion
+            for clip in candidates:
+                clip["detection_method"] = "coaches_activity"
+    for clip in candidates:
+        if clip_too_long(clip["start_time"], clip["end_time"]):
+            clip["boundary_flags"].append(LONG_CLIP_FLAG)
+            clip["segment_confidence"] = min(0.3, clip["segment_confidence"])
+    return candidates
+
+
 def extract_black_intervals(video_bytes: bytes) -> List[dict]:
     """Find brief black frames commonly inserted between coaches-film clips."""
     with tempfile.TemporaryDirectory() as temp_dir:

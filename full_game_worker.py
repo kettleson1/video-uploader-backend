@@ -13,6 +13,7 @@ from datetime import datetime
 
 from sqlalchemy import delete, func, select
 
+from coaches_film_detector import clip_too_long
 from database import async_session
 from job_queue import (
     claim_jobs,
@@ -33,6 +34,7 @@ from main import (
     _s3_key_from_url,
     _safe_err_text,
     ensure_ruleset_columns,
+    play_clip_bounds,
     s3_client,
 )
 from models import Game, Play, PlayFinding, ProcessingJob, SegmentationComparison, Upload
@@ -223,6 +225,10 @@ async def handle_extract_clips(job: ProcessingJob):
             if not play.clip_s3_url
             or play.analysis_status in {"segmented", "queued_for_reanalysis", "error"}
         ]
+        if any(clip_too_long(*play_clip_bounds(play)) for play in target_plays):
+            game.status = "segments_ready"
+            await db.commit()
+            return
         if not target_plays:
             return
         game.status = "extracting_clips"
@@ -234,8 +240,7 @@ async def handle_extract_clips(job: ProcessingJob):
                 clip = await asyncio.to_thread(
                     _extract_clip_bytes,
                     video_bytes,
-                    play.clip_start_time or play.source_start_time,
-                    play.clip_end_time or play.source_end_time,
+                    *play_clip_bounds(play),
                 )
                 key = f"games/{game.id}/plays/{play.play_number}_{play.id}.mp4"
                 play.clip_s3_url = await put_s3(key, clip)
@@ -264,6 +269,11 @@ async def handle_screen_play(job: ProcessingJob):
         game = await db.get(Game, job.game_id)
         if not play or not game or not play.clip_s3_url:
             raise RuntimeError("Play clip is unavailable")
+        if clip_too_long(*play_clip_bounds(play)):
+            game.status = "segments_ready"
+            play.analysis_status = "segmented"
+            await db.commit()
+            return
         if not play.broad_screen:
             play.analysis_status = "screening"
             await db.commit()
@@ -317,6 +327,11 @@ async def handle_analyze_foul(job: ProcessingJob):
         game = await db.get(Game, job.game_id)
         if not play or not game or not play.broad_screen:
             raise RuntimeError("Play evidence is unavailable")
+        if clip_too_long(*play_clip_bounds(play)):
+            game.status = "segments_ready"
+            play.analysis_status = "segmented"
+            await db.commit()
+            return
         if not play.analysis_payload or "findings" not in play.analysis_payload:
             play.analysis_status = "focused_analysis"
             await db.commit()
