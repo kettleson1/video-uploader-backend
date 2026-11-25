@@ -4,6 +4,8 @@ Backend API for DAVE - Digital Artificial Video Evaluation. The service accepts 
 
 ## Coaches-film MVP status
 
+See the [MVP 1 delivery plan](MVP-1-DELIVERY-PLAN.md) for release milestones, proposed pilot targets, and ownership.
+
 On November 19, 2026, the coaches-film development branch has completed a local end-to-end test. The React upload of Leyden–Morton created Game 5. The detector proposed 12 candidates. Removing a setup-only sequence and an incomplete final entry produced the same 10 boundaries as the official's saved review. The worker resumed queued work after restart and completed all 44 jobs. Every extracted clip played in the review screen.
 
 The official judged all 10 plays legal. DAVE returned eight no-foul results and flagged plays 4 and 9 as uncertain. Both involved forward handoffs. The quarterback also carried out a fake on play 9. The subsequent analyzer update asks DAVE to distinguish a hand-to-hand transfer from an airborne shovel pass and to mark a hidden exchange unclear. The genuine short forward pass control is still pending.
