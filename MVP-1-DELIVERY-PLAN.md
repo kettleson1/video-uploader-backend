@@ -22,6 +22,8 @@ The upload and review workflow is ready for staging. The local Leyden–Morton t
 
 5. **Add MVP 1 to the live site.** Introduce a separate **Full Game Review** entry on www.davesystemsinc.com for approved members. Verify the existing single-play uploader before and after enabling the entry. Rehearse withdrawing the new entry while preserving uploaded games and reviews. Expand access in stages after one live member completes upload through saved review, the single-play check passes, and the rollback procedure has been tested.
 
+The [Milestone 1 acceptance packet](acceptance/mvp1/README.md) tracks the companion set, reserved clips, and outstanding official reference.
+
 ## Proposed pilot targets
 
 | Measure | Proposed target |

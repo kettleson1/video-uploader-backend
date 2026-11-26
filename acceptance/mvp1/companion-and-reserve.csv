@@ -1,0 +1,11 @@
+split,clip_id,source_filename,source_sha256,start_seconds,end_seconds,expected_result,expected_label,label_basis
+companion,001,001_york_gbs_dpi.mov,64ada7519334a65bad2d20498272fdb4b9547d6a187b6891f3e30b448d414e51,0,9.976,FOUL,pass_interference_defense,Existing approved golden label
+companion,011,011_obvious_offensive_holding.mov,2b4100eaabf536ad9a0c6dfb22d24e025802eb6a75f7db3aca5323a0a9f0a622,0,14.2,FOUL,holding,Existing approved golden label
+companion,015,015_no_foul_borderline_holding.mov,179135763c966d991c0875aa8f4d54c62790f112c88787ec52e8263c90ece6e5,0,15.147,NO FOUL,None,Existing approved golden label
+companion,016,016_no_foul_clean_coverage.mov,92f31b9774609e02096aaff7c5e0dabb0a4f72b03f444f917c6ce19dbf37fa9d,0,22.958,NO FOUL,None,Existing approved golden label
+reserved,019,019_obvious_illegal_formation.mov,046b25c2a8c5af04b1cac08dd2ae5af1ad6b174190d5b1bd6b919a81d51de257,0,7.012,FOUL,illegal_formation,Existing approved golden label
+reserved,021,021_no_foul_not_illegal_shift.mov,49b05136c420210067723d323d5a361f44a48f1cf7804ab580eaa9397a49e55c,0,37.637,NO FOUL,None,Existing approved golden label
+reserved,024,024_obvious_horse_collar_tackle.mov,bbd6a077456f31e02cb33c870d9cf6b1bec6d0be905204504c21f824c6ffbb59,0,13.983,FOUL,horse_collar_tackle,Existing approved golden label
+reserved,025,025_no_foul_no_kick_catch_interference.mov,ed9ac9855677eca4514f0819f0f2b24adb881927d000c42b66d7aa014909d12a,0,12.498,NO FOUL,None,Existing approved golden label
+companion,LM-04,Test Subject 1 Leyden v Morton.mov,3d98a389bc50c09b5a7dc376dca525dd9f565ebbd1074772d743f590845c534b,48.54,61.59,NO FOUL,None,Official-reviewed legal run and forward handoff
+companion,LM-09,Test Subject 1 Leyden v Morton.mov,3d98a389bc50c09b5a7dc376dca525dd9f565ebbd1074772d743f590845c534b,125.23,138.35,NO FOUL,None,Official-reviewed legal run and forward handoff with quarterback fake
